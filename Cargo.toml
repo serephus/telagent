@@ -1,0 +1,40 @@
+[package]
+name = "telagent"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "7"
+dptree = "0.5"
+futures-util = "0.3"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "stream",
+  "rustls-tls",
+  "multipart",
+] }
+reqwest-eventsource = "0.6"
+redb = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+teloxide = { version = "0.17", default-features = false, features = [
+  "macros",
+  "rustls",
+] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["json"] }
+tempfile = "3"

@@ -1,0 +1,42 @@
+[telegram]
+# Path to a file containing the bot token.
+bot_token_file = "/run/secrets/telagent-bot"
+# Empty means anyone with a valid pairing code.
+allowed_user_ids = []
+# Optional proxy for Telegram API connections. Also supported as TELEGRAM_PROXY.
+# proxy = "socks5h://127.0.0.1:7890"
+
+[opencode]
+backend = "v1" # v1 | v2
+url = "http://127.0.0.1:4096"
+username = "opencode"
+# password_file = "/run/secrets/opencode-server-password"
+events_path = "/global/event"
+# V2 only: read URL and auth from ~/.local/state/opencode/service.json.
+auto_discover = false
+# service_file = "/home/me/.local/state/opencode/service.json"
+
+[notify]
+on_idle = true
+on_error = true
+on_created = false
+permissions = true
+questions = true
+child_sessions = false
+include_last_message = true
+max_telegram_chars = 3900
+
+[notify.paste]
+enabled = false
+provider = "none" # none | paste-rs | zero-zero | custom
+url = ""
+# token_file = "/run/secrets/paste-token"
+threshold_chars = 12000
+
+[storage]
+# Defaults to ~/.local/state/telagent/state.redb
+# path = "/home/me/.local/state/telagent/state.redb"
+
+[security]
+pairing_ttl_secs = 600
+require_bind = true

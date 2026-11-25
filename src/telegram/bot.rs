@@ -70,7 +70,25 @@ async fn handle_message(bot: &Bot, state: &AppState, message: &Message) -> Resul
     if let Some(text) = message.text()
         && let Some((command, args)) = parse_command(text)
     {
-        handle_command(bot, state, message, command, &args, bound).await?;
+        let reply_session_id = match message.reply_to_message() {
+            Some(reply) => {
+                state
+                    .db
+                    .session_for_telegram_message(chat_id.0, reply.id.0)
+                    .await?
+            }
+            None => None,
+        };
+        handle_command(
+            bot,
+            state,
+            message,
+            command,
+            &args,
+            bound,
+            reply_session_id.as_deref(),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -133,6 +151,7 @@ async fn handle_command(
     command: &str,
     args: &[&str],
     bound: bool,
+    reply_session_id: Option<&str>,
 ) -> Result<()> {
     let chat_id = message.chat.id;
     let user_id = message.from.as_ref().map(|user| user.id.0).unwrap_or(0);
@@ -223,7 +242,9 @@ async fn handle_command(
             }
         }
         "compact" => {
-            let Some(session_id) = resolve_session_id(state, chat_id.0, args).await? else {
+            let Some(session_id) =
+                resolve_session_id(state, chat_id.0, args, reply_session_id).await?
+            else {
                 send(bot, chat_id, "No active session. Pass a session ID.").await?;
                 return Ok(());
             };
@@ -266,7 +287,9 @@ async fn handle_command(
             }
         }
         "mute" | "unmute" => {
-            let Some(session_id) = resolve_session_id(state, chat_id.0, args).await? else {
+            let Some(session_id) =
+                resolve_session_id(state, chat_id.0, args, reply_session_id).await?
+            else {
                 send(bot, chat_id, "No active session. Pass a session ID.").await?;
                 return Ok(());
             };
@@ -283,7 +306,9 @@ async fn handle_command(
             .await?;
         }
         "abort" => {
-            let Some(session_id) = resolve_session_id(state, chat_id.0, args).await? else {
+            let Some(session_id) =
+                resolve_session_id(state, chat_id.0, args, reply_session_id).await?
+            else {
                 send(bot, chat_id, "No active session. Pass a session ID.").await?;
                 return Ok(());
             };
@@ -620,9 +645,13 @@ async fn resolve_session_id(
     state: &AppState,
     chat_id: i64,
     args: &[&str],
+    reply_session_id: Option<&str>,
 ) -> Result<Option<String>> {
     if let Some(session_id) = args.first() {
         return Ok(Some((*session_id).to_string()));
+    }
+    if let Some(session_id) = reply_session_id {
+        return Ok(Some(session_id.to_string()));
     }
     state.db.active_session(chat_id).await
 }

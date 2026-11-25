@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -45,6 +48,62 @@ pub async fn event_loop(state: AppState) {
         tracing::info!(backoff, "reconnecting to opencode event stream");
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
+    }
+}
+
+pub async fn reconcile_loop(state: AppState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+        reconcile_pending_permissions(&state).await;
+    }
+}
+
+async fn reconcile_pending_permissions(state: &AppState) {
+    let requests = match state.db.list_pending_requests().await {
+        Ok(requests) => requests,
+        Err(error) => {
+            tracing::warn!(%error, "failed to read pending requests");
+            return;
+        }
+    };
+
+    let mut checked: HashMap<String, Option<HashSet<String>>> = HashMap::new();
+    for request in requests
+        .into_iter()
+        .filter(|request| request.kind == "permission")
+    {
+        let ids = if let Some(ids) = checked.get(&request.session_id) {
+            ids.clone()
+        } else {
+            let directory = match state.session_directory(&request.session_id).await {
+                Ok(directory) => directory,
+                Err(error) => {
+                    tracing::warn!(%error, session_id = %request.session_id, "failed to read session directory");
+                    continue;
+                }
+            };
+            let ids = match state
+                .backend
+                .pending_permission_ids(&request.session_id, &directory)
+                .await
+            {
+                Ok(ids) => ids,
+                Err(error) => {
+                    tracing::warn!(%error, session_id = %request.session_id, "failed to list pending permissions");
+                    continue;
+                }
+            };
+            checked.insert(request.session_id.clone(), ids.clone());
+            ids
+        };
+
+        if let Some(ids) = ids
+            && !ids.contains(&request.request_id)
+            && let Err(error) = state.db.remove_pending_request(&request.request_id).await
+        {
+            tracing::warn!(%error, request_id = %request.request_id, "failed to remove stale permission request");
+        }
     }
 }
 

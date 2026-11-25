@@ -547,6 +547,20 @@ impl Db {
         .await
     }
 
+    pub async fn list_pending_requests(&self) -> Result<Vec<PendingRequest>> {
+        self.run(move |db| {
+            let read = db.begin_read()?;
+            let table = read.open_table(PENDING)?;
+            let mut requests = Vec::new();
+            for entry in table.iter()? {
+                let (_, value) = entry?;
+                requests.push(decode::<PendingRequest>(value.value())?);
+            }
+            Ok(requests)
+        })
+        .await
+    }
+
     pub async fn get_pending_request_for_chat(
         &self,
         request_id: &str,
@@ -891,6 +905,7 @@ mod tests {
         db.add_pending_request("per_1", "permission", "ses_1", Some(2), Some(20), None)
             .await
             .unwrap();
+        assert_eq!(db.list_pending_requests().await.unwrap().len(), 2);
 
         assert!(
             db.get_pending_request_for_chat("per_1", 1)
@@ -915,6 +930,7 @@ mod tests {
         assert_eq!(by_message.unwrap().request_id, "per_1");
 
         db.remove_pending_request("per_1").await.unwrap();
+        assert!(db.list_pending_requests().await.unwrap().is_empty());
         assert!(
             db.get_pending_request_for_chat("per_1", 1)
                 .await

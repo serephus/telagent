@@ -208,6 +208,11 @@ reports it.
 single question. For custom or multi-question requests, reply to the message
 with text. For multiple questions, send one answer per line.
 
+Permission confirmations include the permission name and patterns. Pending
+permission requests are reconciled with opencode, so expired or already
+answered requests are dropped from the bot while their Telegram messages stay
+in history. Link previews are disabled in bot messages.
+
 ## Configuration
 
 See `examples/config.toml`. The service uses

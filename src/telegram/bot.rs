@@ -3,16 +3,17 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::Result;
 use teloxide::{
     Bot,
+    payloads::SendMessageSetters,
     prelude::*,
     types::{
-        CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup,
+        CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions,
         MaybeInaccessibleMessage, Message, Update, UpdateKind,
     },
 };
 
 use crate::{
     app::AppState,
-    opencode::types::{PermissionReply, QuestionRequest},
+    opencode::types::{PermissionReply, PermissionRequest, QuestionRequest},
     pairing, render,
 };
 
@@ -517,16 +518,24 @@ async fn handle_callback(bot: &Bot, state: &AppState, callback: &CallbackQuery) 
             {
                 Ok(()) => {
                     let _ = state.db.remove_pending_request(request_id).await;
-                    send(
-                        bot,
-                        ChatId(chat_id),
-                        format!(
-                            "Permission response sent: {}\nSession: {}",
-                            reply.as_str(),
-                            pending.session_id
-                        ),
-                    )
-                    .await?;
+                    let request = pending.payload.as_deref().and_then(|payload| {
+                        serde_json::from_str::<PermissionRequest>(payload).ok()
+                    });
+                    let mut text = format!(
+                        "Permission response sent: {}\nSession: {}",
+                        reply.as_str(),
+                        pending.session_id
+                    );
+                    if let Some(request) = request {
+                        text.push_str(&format!("\nPermission: {}", request.permission));
+                        if !request.patterns.is_empty() {
+                            text.push_str(&format!(
+                                "\nPatterns: {}",
+                                render::truncate(&request.patterns.join(", "), 1500)
+                            ));
+                        }
+                    }
+                    send(bot, ChatId(chat_id), text).await?;
                 }
                 Err(error) => {
                     send(bot, ChatId(chat_id), format!("Permission failed: {error}")).await?;
@@ -739,6 +748,13 @@ async fn send_sessions(bot: &Bot, state: &AppState, chat_id: ChatId) -> Result<(
 
     bot.send_message(chat_id, text)
         .reply_markup(InlineKeyboardMarkup::new(rows))
+        .link_preview_options(LinkPreviewOptions {
+            is_disabled: true,
+            url: None,
+            prefer_small_media: false,
+            prefer_large_media: false,
+            show_above_text: false,
+        })
         .await?;
     Ok(())
 }
@@ -776,7 +792,15 @@ fn resolve_directory(requested: &str, base: &str) -> PathBuf {
 }
 
 async fn send(bot: &Bot, chat_id: ChatId, text: impl Into<String>) -> Result<()> {
-    bot.send_message(chat_id, text.into()).await?;
+    bot.send_message(chat_id, text.into())
+        .link_preview_options(LinkPreviewOptions {
+            is_disabled: true,
+            url: None,
+            prefer_small_media: false,
+            prefer_large_media: false,
+            show_above_text: false,
+        })
+        .await?;
     Ok(())
 }
 

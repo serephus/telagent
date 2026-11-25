@@ -1,4 +1,7 @@
-use std::{collections::HashMap, pin::Pin};
+use std::{
+    collections::{HashMap, HashSet},
+    pin::Pin,
+};
 
 use async_trait::async_trait;
 use futures_util::Stream;
@@ -53,6 +56,12 @@ pub trait OpenCodeBackend: Send + Sync {
         request_id: &str,
         reply: PermissionReply,
     ) -> anyhow::Result<()>;
+
+    async fn pending_permission_ids(
+        &self,
+        session_id: &str,
+        directory: &str,
+    ) -> anyhow::Result<Option<HashSet<String>>>;
 
     async fn reply_question(
         &self,

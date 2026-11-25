@@ -109,6 +109,9 @@ async fn run_daemon(config: Config) -> Result<()> {
     let outbox_state = (*state).clone();
     let outbox_task = tokio::spawn(daemon::outbox_loop(outbox_state));
 
+    let reconcile_state = (*state).clone();
+    let reconcile_task = tokio::spawn(daemon::reconcile_loop(reconcile_state));
+
     let event_state = (*state).clone();
     let event_task = tokio::spawn(daemon::event_loop(event_state));
 
@@ -117,6 +120,7 @@ async fn run_daemon(config: Config) -> Result<()> {
 
     dispatcher_task.abort();
     outbox_task.abort();
+    reconcile_task.abort();
     event_task.abort();
     Ok(())
 }

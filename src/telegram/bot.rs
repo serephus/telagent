@@ -139,12 +139,7 @@ async fn handle_command(
 
     match command {
         "start" | "help" => {
-            send(
-                bot,
-                chat_id,
-                "telagent\n\nCommands:\n/bind CODE\n/unbind\n/sessions\n/use ID\n/status\n/mute [ID]\n/unmute [ID]\n/abort [ID]\n/help\n\nReply to a notification to send feedback.",
-            )
-            .await?;
+            send(bot, chat_id, crate::telegram::commands::help_text()).await?;
         }
         "bind" => {
             let Some(code) = args.first() else {

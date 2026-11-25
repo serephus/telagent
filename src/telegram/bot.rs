@@ -239,6 +239,7 @@ async fn handle_command(
             if !directory.is_empty()
                 && let Err(error) = std::fs::create_dir_all(&directory)
             {
+                tracing::warn!(directory = %directory, %error, "failed to create session directory");
                 send(
                     bot,
                     chat_id,
@@ -247,6 +248,23 @@ async fn handle_command(
                 .await?;
                 return Ok(());
             }
+            let directory = if directory.is_empty() {
+                directory
+            } else {
+                match std::fs::canonicalize(&directory) {
+                    Ok(path) => path.to_string_lossy().into_owned(),
+                    Err(error) => {
+                        tracing::warn!(directory = %directory, %error, "failed to resolve session directory");
+                        send(
+                            bot,
+                            chat_id,
+                            format!("Failed to resolve directory {directory}: {error}"),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            };
             match state.backend.create_session(&directory).await {
                 Ok(info) => {
                     let session = state.sync_session(&info, "idle").await?;
@@ -270,7 +288,13 @@ async fn handle_command(
                     .await?;
                 }
                 Err(error) => {
-                    send(bot, chat_id, format!("Failed to start session: {error}")).await?;
+                    tracing::warn!(directory = %directory, %error, "failed to create session");
+                    send(
+                        bot,
+                        chat_id,
+                        format!("Failed to start session in {directory}: {error}"),
+                    )
+                    .await?;
                 }
             }
         }

@@ -8,7 +8,7 @@ use teloxide::{
 
 use crate::{
     config::Config,
-    opencode::types::{PermissionRequest, QuestionRequest},
+    opencode::types::{PermissionRequest, QuestionRequest, SessionContext},
     paste::PasteClient,
     render,
     state::{Db, SessionRecord},
@@ -38,8 +38,9 @@ impl Notifier {
         &self,
         session: &SessionRecord,
         body: Option<&str>,
+        context: Option<&SessionContext>,
     ) -> Result<(String, Vec<(i64, i32)>)> {
-        let text = render::completion_message(session, body);
+        let text = render::completion_message(session, body, context);
         let markup = completion_markup(&session.session_id);
         let sent = self
             .deliver(&session.session_id, "completion", &text, Some(markup))

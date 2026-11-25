@@ -274,7 +274,21 @@ async fn notify_completion(state: &AppState, session_id: &str) -> Result<()> {
     } else {
         None
     };
-    let (_, sent) = state.notifier.notify_completion(&session, body).await?;
+    let context = match state
+        .backend
+        .session_context(session_id, &session.directory)
+        .await
+    {
+        Ok(context) => context,
+        Err(error) => {
+            tracing::debug!(%error, "failed to read session context");
+            None
+        }
+    };
+    let (_, sent) = state
+        .notifier
+        .notify_completion(&session, body, context.as_ref())
+        .await?;
     if !sent.is_empty() {
         state
             .db

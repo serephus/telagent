@@ -22,6 +22,13 @@ pub struct SessionModel {
     pub provider_id: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SessionContext {
+    pub model: Option<String>,
+    pub used_tokens: Option<u64>,
+    pub context_limit: Option<u64>,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum SessionStatus {
@@ -66,6 +73,40 @@ pub struct MessageInfo {
     pub role: String,
     #[serde(default)]
     pub time: MessageTime,
+    #[serde(default)]
+    pub tokens: MessageTokens,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MessageTokens {
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub reasoning: u64,
+    #[serde(default)]
+    pub cache: CacheTokens,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CacheTokens {
+    #[serde(default)]
+    pub read: u64,
+    #[serde(default)]
+    pub write: u64,
+}
+
+impl MessageTokens {
+    pub fn total(&self) -> u64 {
+        if self.total > 0 {
+            self.total
+        } else {
+            self.input + self.output + self.reasoning + self.cache.read + self.cache.write
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

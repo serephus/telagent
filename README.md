@@ -182,6 +182,9 @@ Notifications also include inline buttons:
 - `Mute` suppresses completion notifications for that session.
 - `Sessions` lists recent sessions.
 
+Completion notifications include the model and context usage when opencode
+reports it.
+
 ## Permissions and questions
 
 `permission.asked` becomes a Telegram message with:

@@ -6,12 +6,15 @@ use futures_util::StreamExt;
 use reqwest::{Client, RequestBuilder, StatusCode};
 use reqwest_eventsource::{Event, EventSource};
 use serde::{Serialize, de::DeserializeOwned};
+use serde_json::Value;
 
 use crate::{
     config::OpenCodeConfig,
     opencode::{
         backend::{EventStream, OpenCodeBackend},
-        types::{MessageWithParts, PermissionReply, RawEvent, SessionInfo, SessionStatus},
+        types::{
+            MessageWithParts, PermissionReply, RawEvent, SessionContext, SessionInfo, SessionStatus,
+        },
     },
 };
 
@@ -166,6 +169,54 @@ impl OpenCodeBackend for V1Http {
             },
         )
         .await
+    }
+
+    async fn session_context(
+        &self,
+        session_id: &str,
+        directory: &str,
+    ) -> Result<Option<SessionContext>> {
+        let Some(session) = self.get_session(session_id).await? else {
+            return Ok(None);
+        };
+
+        let messages = self.messages(session_id, directory, 10).await?;
+        let used_tokens = messages
+            .iter()
+            .filter(|message| message.is_assistant())
+            .max_by_key(|message| message.info.time.created)
+            .map(|message| message.info.tokens.total())
+            .filter(|tokens| *tokens > 0);
+
+        let model = session.model;
+        let context_limit = match &model {
+            Some(model) => {
+                let providers: Value = self.get_json("/config/providers", "").await?;
+                providers
+                    .get("providers")
+                    .and_then(Value::as_array)
+                    .and_then(|providers| {
+                        providers
+                            .iter()
+                            .find(|provider| {
+                                provider.get("id").and_then(Value::as_str)
+                                    == Some(model.provider_id.as_str())
+                            })
+                            .and_then(|provider| provider.get("models"))
+                            .and_then(|models| models.get(&model.id))
+                            .and_then(|model| model.get("limit"))
+                            .and_then(|limit| limit.get("context"))
+                            .and_then(Value::as_u64)
+                    })
+            }
+            None => None,
+        };
+
+        Ok(Some(SessionContext {
+            model: model.map(|model| model.id),
+            used_tokens,
+            context_limit,
+        }))
     }
 
     async fn session_statuses(&self) -> Result<HashMap<String, SessionStatus>> {
@@ -532,6 +583,70 @@ mod tests {
         let body = body.as_ref().unwrap();
         assert_eq!(body["providerID"], "openai");
         assert_eq!(body["modelID"], "gpt-5");
+    }
+
+    #[tokio::test]
+    async fn reads_session_context_usage() {
+        let router = Router::new()
+            .route(
+                "/session/{session_id}",
+                get(|| async {
+                    Json(json!({
+                        "id": "ses_1",
+                        "title": "Test session",
+                        "directory": "/tmp/project",
+                        "model": {"id": "gpt-5", "providerID": "openai"}
+                    }))
+                }),
+            )
+            .route(
+                "/session/{session_id}/message",
+                get(|| async {
+                    Json(json!([{
+                        "info": {
+                            "id": "msg_1",
+                            "role": "assistant",
+                            "time": {"created": 1, "completed": 2},
+                            "tokens": {
+                                "total": 750000,
+                                "input": 750000,
+                                "output": 0,
+                                "reasoning": 0,
+                                "cache": {"read": 0, "write": 0}
+                            }
+                        },
+                        "parts": [{"type": "text", "text": "done"}]
+                    }]))
+                }),
+            )
+            .route(
+                "/config/providers",
+                get(|| async {
+                    Json(json!({
+                        "providers": [{
+                            "id": "openai",
+                            "models": {
+                                "gpt-5": {"limit": {"context": 1000000}}
+                            }
+                        }]
+                    }))
+                }),
+            );
+        let url = spawn(router).await;
+        let config = OpenCodeConfig {
+            url,
+            ..Default::default()
+        };
+        let client = V1Http::new(&config).unwrap();
+
+        let context = client
+            .session_context("ses_1", "/tmp/project")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.model.as_deref(), Some("gpt-5"));
+        assert_eq!(context.used_tokens, Some(750_000));
+        assert_eq!(context.context_limit, Some(1_000_000));
     }
 
     #[tokio::test]

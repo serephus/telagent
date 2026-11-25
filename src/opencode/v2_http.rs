@@ -13,9 +13,9 @@ use crate::{
     opencode::{
         backend::{AgentEvent, EventStream, OpenCodeBackend},
         types::{
-            MessageInfo, MessageTime, MessageWithParts, Part, PermissionReply, PermissionRequest,
-            QuestionInfo, QuestionOption, QuestionRequest, RawEvent, SessionInfo, SessionModel,
-            SessionStatus,
+            CacheTokens, MessageInfo, MessageTime, MessageTokens, MessageWithParts, Part,
+            PermissionReply, PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest,
+            RawEvent, SessionContext, SessionInfo, SessionModel, SessionStatus,
         },
     },
 };
@@ -278,6 +278,54 @@ impl OpenCodeBackend for V2Http {
             .await
     }
 
+    async fn session_context(
+        &self,
+        session_id: &str,
+        _directory: &str,
+    ) -> Result<Option<SessionContext>> {
+        let Some(session) = self.get_session(session_id).await? else {
+            return Ok(None);
+        };
+
+        let messages = self.messages(session_id, "", 10).await?;
+        let used_tokens = messages
+            .iter()
+            .filter(|message| message.is_assistant())
+            .max_by_key(|message| message.info.time.created)
+            .map(|message| message.info.tokens.total())
+            .filter(|tokens| *tokens > 0);
+
+        let model = session.model;
+        let context_limit = match &model {
+            Some(model) => {
+                let response: Value = self.get_json("/api/model").await?;
+                response
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .and_then(|models| {
+                        models
+                            .iter()
+                            .find(|candidate| {
+                                candidate.get("id").and_then(Value::as_str)
+                                    == Some(model.id.as_str())
+                                    && candidate.get("providerID").and_then(Value::as_str)
+                                        == Some(model.provider_id.as_str())
+                            })
+                            .and_then(|candidate| candidate.get("limit"))
+                            .and_then(|limit| limit.get("context"))
+                            .and_then(Value::as_u64)
+                    })
+            }
+            None => None,
+        };
+
+        Ok(Some(SessionContext {
+            model: model.map(|model| model.id),
+            used_tokens,
+            context_limit,
+        }))
+    }
+
     async fn session_statuses(&self) -> Result<HashMap<String, SessionStatus>> {
         let response: ActiveResponse = self.get_json("/api/session/active").await?;
         Ok(response
@@ -509,9 +557,40 @@ fn normalize_message(value: &Value) -> Option<MessageWithParts> {
             id,
             role: "assistant".to_string(),
             time: MessageTime { created, completed },
+            tokens: tokens_from_v2(value),
         },
         parts,
     })
+}
+
+fn tokens_from_v2(value: &Value) -> MessageTokens {
+    let tokens = value.get("tokens");
+    let cache = tokens.and_then(|tokens| tokens.get("cache"));
+    MessageTokens {
+        total: 0,
+        input: tokens
+            .and_then(|tokens| tokens.get("input"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        output: tokens
+            .and_then(|tokens| tokens.get("output"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        reasoning: tokens
+            .and_then(|tokens| tokens.get("reasoning"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache: CacheTokens {
+            read: cache
+                .and_then(|cache| cache.get("read"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            write: cache
+                .and_then(|cache| cache.get("write"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        },
+    }
 }
 
 fn number_to_i64(value: &Value) -> Option<i64> {

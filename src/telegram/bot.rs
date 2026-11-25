@@ -300,7 +300,16 @@ async fn handle_command(
         }
         "status" => {
             let sessions = state.db.list_sessions(&state.instance_id, 10).await?;
-            send(bot, chat_id, render::sessions_message(&sessions)).await?;
+            let active_session = state.db.active_session(chat_id.0).await?;
+            let pending = state.db.pending_request_count(chat_id.0).await?;
+            let mut text = render::sessions_message(&sessions, active_session.as_deref());
+            if let Some(active_session) = &active_session {
+                text.push_str(&format!("\n\nActive session: {active_session}"));
+            }
+            if pending > 0 {
+                text.push_str(&format!("\nPending requests: {pending}"));
+            }
+            send(bot, chat_id, text).await?;
         }
         "use" => {
             let Some(session_id) = args.first() else {
@@ -319,6 +328,20 @@ async fn handle_command(
                 send(bot, chat_id, "Unknown session.").await?;
             }
         }
+        "cancel" => match state.db.active_session(chat_id.0).await? {
+            Some(session_id) => {
+                state.db.clear_active_session(chat_id.0).await?;
+                send(
+                    bot,
+                    chat_id,
+                    format!("Cleared active session {session_id}."),
+                )
+                .await?;
+            }
+            None => {
+                send(bot, chat_id, "No active session.").await?;
+            }
+        },
         "mute" | "unmute" => {
             let Some(session_id) =
                 resolve_session_id(state, chat_id.0, args, reply_session_id).await?
@@ -652,7 +675,8 @@ async fn answer_pending_question(
 
 async fn send_sessions(bot: &Bot, state: &AppState, chat_id: ChatId) -> Result<()> {
     let sessions = state.db.list_sessions(&state.instance_id, 10).await?;
-    let text = render::sessions_message(&sessions);
+    let active_session = state.db.active_session(chat_id.0).await?;
+    let text = render::sessions_message(&sessions, active_session.as_deref());
     if sessions.is_empty() {
         send(bot, chat_id, text).await?;
         return Ok(());

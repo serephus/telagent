@@ -158,6 +158,7 @@ and interact with the bot. An empty list relies on the pairing code alone.
 /compact [ID]
 /sessions
 /use ID
+/cancel
 /status
 /mute [ID]
 /unmute [ID]
@@ -169,7 +170,8 @@ Reply to any notification to send feedback to that session. If no reply target
 is set, the active session from `/use` is used.
 
 Commands such as `/compact`, `/mute`, and `/abort` also use the replied
-notification's session when sent as a reply.
+notification's session when sent as a reply. `/cancel` clears the active
+session selection; `/status` shows it with a `*` and reports pending requests.
 
 `/new` creates a session and makes it active. Missing directories are created.
 Without a directory it uses the active session's directory, then

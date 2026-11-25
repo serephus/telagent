@@ -429,6 +429,37 @@ impl Db {
         .await
     }
 
+    pub async fn clear_active_session(&self, chat_id: i64) -> Result<()> {
+        let key = active_session_key(chat_id);
+        self.run(move |db| {
+            let write = db.begin_write()?;
+            {
+                let mut table = write.open_table(KV)?;
+                table.remove(key.as_str())?;
+            }
+            write.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn pending_request_count(&self, chat_id: i64) -> Result<usize> {
+        self.run(move |db| {
+            let read = db.begin_read()?;
+            let table = read.open_table(PENDING)?;
+            let mut count = 0;
+            for entry in table.iter()? {
+                let (_, value) = entry?;
+                let record: PendingRequest = decode(value.value())?;
+                if record.chat_id == Some(chat_id) {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        })
+        .await
+    }
+
     pub async fn store_telegram_message(
         &self,
         chat_id: i64,

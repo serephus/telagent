@@ -49,6 +49,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Select the active session",
     },
     CommandSpec {
+        name: "cancel",
+        usage: "",
+        description: "Clear the active session",
+    },
+    CommandSpec {
         name: "status",
         usage: "",
         description: "Show bound sessions and state",

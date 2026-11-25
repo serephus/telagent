@@ -69,6 +69,7 @@ async fn reconcile_pending_permissions(state: &AppState) {
     };
 
     let mut checked: HashMap<String, Option<HashSet<String>>> = HashMap::new();
+    let mut stale: HashSet<String> = HashSet::new();
     for request in requests
         .into_iter()
         .filter(|request| request.kind == "permission")
@@ -100,7 +101,8 @@ async fn reconcile_pending_permissions(state: &AppState) {
 
         if let Some(ids) = ids
             && !ids.contains(&request.request_id)
-            && let Err(error) = state.db.remove_pending_request(&request.request_id).await
+            && stale.insert(request.request_id.clone())
+            && let Err(error) = state.forget_pending_request(&request.request_id).await
         {
             tracing::warn!(%error, request_id = %request.request_id, "failed to remove stale permission request");
         }
@@ -266,7 +268,9 @@ async fn handle_event(state: &AppState, event: AgentEvent) -> Result<()> {
             reply,
         } => {
             tracing::debug!(session_id, request_id, reply, "permission replied");
-            let _ = state.db.remove_pending_request(&request_id).await;
+            if let Err(error) = state.forget_pending_request(&request_id).await {
+                tracing::warn!(%error, request_id, "failed to remove replied permission request");
+            }
         }
         AgentEvent::QuestionReplied {
             session_id,

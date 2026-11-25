@@ -517,7 +517,6 @@ async fn handle_callback(bot: &Bot, state: &AppState, callback: &CallbackQuery) 
                 .await
             {
                 Ok(()) => {
-                    let _ = state.db.remove_pending_request(request_id).await;
                     let request = pending.payload.as_deref().and_then(|payload| {
                         serde_json::from_str::<PermissionRequest>(payload).ok()
                     });
@@ -536,6 +535,9 @@ async fn handle_callback(bot: &Bot, state: &AppState, callback: &CallbackQuery) 
                         }
                     }
                     send(bot, ChatId(chat_id), text).await?;
+                    if let Err(error) = state.forget_pending_request(request_id).await {
+                        tracing::warn!(%error, request_id, "failed to remove permission request");
+                    }
                 }
                 Err(error) => {
                     send(bot, ChatId(chat_id), format!("Permission failed: {error}")).await?;

@@ -3,7 +3,7 @@ use teloxide::{
     Bot,
     payloads::SendMessageSetters,
     prelude::Requester,
-    types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions},
+    types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, MessageId},
 };
 
 use crate::{
@@ -115,6 +115,19 @@ impl Notifier {
                 .await?;
         }
         Ok(sent)
+    }
+
+    pub async fn delete_telegram_message(&self, chat_id: Option<i64>, message_id: Option<i32>) {
+        let (Some(chat_id), Some(message_id)) = (chat_id, message_id) else {
+            return;
+        };
+        if let Err(error) = self
+            .bot
+            .delete_message(ChatId(chat_id), MessageId(message_id))
+            .await
+        {
+            tracing::warn!(chat_id, message_id, %error, "failed to delete telegram message");
+        }
     }
 
     pub async fn notify_created(&self, session: &SessionRecord) -> Result<Vec<(i64, i32)>> {

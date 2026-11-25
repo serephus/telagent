@@ -13,8 +13,9 @@ use crate::{
     opencode::{
         backend::{AgentEvent, EventStream, OpenCodeBackend},
         types::{
-            MessageInfo, MessageTime, MessageWithParts, Part, PermissionReply, PermissionRequest,
-            QuestionInfo, QuestionOption, QuestionRequest, RawEvent, SessionInfo, SessionStatus,
+            CacheTokens, MessageInfo, MessageTime, MessageTokens, MessageWithParts, Part,
+            PermissionReply, PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest,
+            RawEvent, SessionContext, SessionInfo, SessionModel, SessionStatus,
         },
     },
 };
@@ -208,6 +209,19 @@ impl V2Http {
         ensure_success(response).await
     }
 
+    async fn post_json_decode<T: serde::de::DeserializeOwned, B: serde::Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let response = self
+            .request(reqwest::Method::POST, path)
+            .json(body)
+            .send()
+            .await?;
+        decode(response).await
+    }
+
     async fn post_empty(&self, path: &str) -> Result<()> {
         let response = self.request(reqwest::Method::POST, path).send().await?;
         ensure_success(response).await
@@ -225,18 +239,91 @@ impl OpenCodeBackend for V2Http {
         Ok(response
             .data
             .into_iter()
-            .map(|session| SessionInfo {
-                id: session.id,
-                title: session.title.unwrap_or_default(),
-                directory: session
-                    .location
-                    .as_ref()
-                    .map(|location| location.directory.clone())
-                    .unwrap_or_default(),
-                project_id: session.project_id,
-                parent_id: session.parent_id,
-            })
+            .map(session_info_from_v2_session)
             .collect())
+    }
+
+    async fn get_session(&self, session_id: &str) -> Result<Option<SessionInfo>> {
+        let response = self
+            .request(reqwest::Method::GET, &format!("/api/session/{session_id}"))
+            .send()
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response: CreateSessionResponse = decode(response).await?;
+        Ok(Some(session_info_from_v2_session(response.data)))
+    }
+
+    async fn create_session(&self, directory: &str) -> Result<SessionInfo> {
+        let directory = if directory.is_empty() {
+            std::env::current_dir()
+                .context("failed to resolve current directory")?
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            directory.to_string()
+        };
+        let response: CreateSessionResponse = self
+            .post_json_decode(
+                "/api/session",
+                &json!({"location": {"directory": directory}}),
+            )
+            .await?;
+        Ok(session_info_from_v2_session(response.data))
+    }
+
+    async fn compact_session(&self, session_id: &str, _directory: &str) -> Result<()> {
+        self.post_empty(&format!("/api/session/{session_id}/compact"))
+            .await
+    }
+
+    async fn session_context(
+        &self,
+        session_id: &str,
+        _directory: &str,
+    ) -> Result<Option<SessionContext>> {
+        let Some(session) = self.get_session(session_id).await? else {
+            return Ok(None);
+        };
+
+        let messages = self.messages(session_id, "", 10).await?;
+        let used_tokens = messages
+            .iter()
+            .filter(|message| message.is_assistant())
+            .max_by_key(|message| message.info.time.created)
+            .map(|message| message.info.tokens.total())
+            .filter(|tokens| *tokens > 0);
+
+        let model = session.model;
+        let context_limit = match &model {
+            Some(model) => {
+                let response: Value = self.get_json("/api/model").await?;
+                response
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .and_then(|models| {
+                        models
+                            .iter()
+                            .find(|candidate| {
+                                candidate.get("id").and_then(Value::as_str)
+                                    == Some(model.id.as_str())
+                                    && candidate.get("providerID").and_then(Value::as_str)
+                                        == Some(model.provider_id.as_str())
+                            })
+                            .and_then(|candidate| candidate.get("limit"))
+                            .and_then(|limit| limit.get("context"))
+                            .and_then(Value::as_u64)
+                    })
+            }
+            None => None,
+        };
+
+        Ok(Some(SessionContext {
+            model: model.map(|model| model.id),
+            used_tokens,
+            context_limit,
+        }))
     }
 
     async fn session_statuses(&self) -> Result<HashMap<String, SessionStatus>> {
@@ -248,7 +335,12 @@ impl OpenCodeBackend for V2Http {
             .collect())
     }
 
-    async fn messages(&self, session_id: &str, limit: usize) -> Result<Vec<MessageWithParts>> {
+    async fn messages(
+        &self,
+        session_id: &str,
+        _directory: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageWithParts>> {
         let response: MessagesResponse = self
             .get_json(&format!(
                 "/api/session/{session_id}/message?limit={limit}&order=desc"
@@ -257,7 +349,7 @@ impl OpenCodeBackend for V2Http {
         Ok(response.data.iter().filter_map(normalize_message).collect())
     }
 
-    async fn prompt_async(&self, session_id: &str, text: &str) -> Result<()> {
+    async fn prompt_async(&self, session_id: &str, _directory: &str, text: &str) -> Result<()> {
         #[derive(serde::Serialize)]
         struct Body<'a> {
             text: &'a str,
@@ -266,7 +358,7 @@ impl OpenCodeBackend for V2Http {
             .await
     }
 
-    async fn abort(&self, session_id: &str) -> Result<()> {
+    async fn abort(&self, session_id: &str, _directory: &str) -> Result<()> {
         self.post_empty(&format!("/api/session/{session_id}/interrupt"))
             .await
     }
@@ -274,6 +366,7 @@ impl OpenCodeBackend for V2Http {
     async fn reply_permission(
         &self,
         session_id: &str,
+        _directory: &str,
         request_id: &str,
         reply: PermissionReply,
     ) -> Result<()> {
@@ -293,6 +386,7 @@ impl OpenCodeBackend for V2Http {
     async fn reply_question(
         &self,
         session_id: &str,
+        _directory: &str,
         request_id: &str,
         request: &QuestionRequest,
         answers: Vec<Vec<String>>,
@@ -363,6 +457,11 @@ struct SessionsResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct CreateSessionResponse {
+    data: V2Session,
+}
+
+#[derive(Debug, Deserialize)]
 struct V2Session {
     id: String,
     #[serde(default)]
@@ -373,11 +472,39 @@ struct V2Session {
     parent_id: Option<String>,
     #[serde(default)]
     location: Option<V2Location>,
+    #[serde(default)]
+    model: Option<V2Model>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2Model {
+    id: String,
+    #[serde(rename = "providerID")]
+    provider_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct V2Location {
     directory: String,
+}
+
+fn session_info_from_v2_session(session: V2Session) -> SessionInfo {
+    SessionInfo {
+        id: session.id,
+        title: session.title.unwrap_or_default(),
+        directory: session
+            .location
+            .map(|location| location.directory)
+            .unwrap_or_default(),
+        project_id: session.project_id,
+        parent_id: session.parent_id,
+        model: session
+            .model
+            .map(|model| crate::opencode::types::SessionModel {
+                id: model.id,
+                provider_id: model.provider_id,
+            }),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -430,9 +557,40 @@ fn normalize_message(value: &Value) -> Option<MessageWithParts> {
             id,
             role: "assistant".to_string(),
             time: MessageTime { created, completed },
+            tokens: tokens_from_v2(value),
         },
         parts,
     })
+}
+
+fn tokens_from_v2(value: &Value) -> MessageTokens {
+    let tokens = value.get("tokens");
+    let cache = tokens.and_then(|tokens| tokens.get("cache"));
+    MessageTokens {
+        total: 0,
+        input: tokens
+            .and_then(|tokens| tokens.get("input"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        output: tokens
+            .and_then(|tokens| tokens.get("output"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        reasoning: tokens
+            .and_then(|tokens| tokens.get("reasoning"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache: CacheTokens {
+            read: cache
+                .and_then(|cache| cache.get("read"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            write: cache
+                .and_then(|cache| cache.get("write"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        },
+    }
 }
 
 fn number_to_i64(value: &Value) -> Option<i64> {
@@ -569,6 +727,12 @@ fn session_info_from_v2(data: &Value) -> Option<SessionInfo> {
             .get("parentID")
             .and_then(Value::as_str)
             .map(str::to_string),
+        model: data.get("model").and_then(|model| {
+            Some(SessionModel {
+                id: model.get("id")?.as_str()?.to_string(),
+                provider_id: model.get("providerID")?.as_str()?.to_string(),
+            })
+        }),
     })
 }
 
@@ -985,6 +1149,16 @@ mod integration_tests {
                         }],
                         "cursor": {"previous": null, "next": null}
                     }))
+                })
+                .post(|| async {
+                    Json(json!({
+                        "data": {
+                            "id": "ses_2",
+                            "title": "New session",
+                            "projectID": "prj_1",
+                            "location": {"directory": "/tmp/project"}
+                        }
+                    }))
                 }),
             )
             .route(
@@ -1009,6 +1183,10 @@ mod integration_tests {
             .route(
                 "/api/session/{session_id}/interrupt",
                 post(|| async { AxumStatus::OK }),
+            )
+            .route(
+                "/api/session/{session_id}/compact",
+                post(|| async { AxumStatus::NO_CONTENT }),
             )
             .route(
                 "/api/session/{session_id}/permission/{request_id}/reply",
@@ -1044,22 +1222,27 @@ mod integration_tests {
         assert_eq!(sessions[0].title, "Test session");
         assert_eq!(sessions[0].directory, "/tmp");
 
+        let created = client.create_session("/tmp/project").await.unwrap();
+        assert_eq!(created.id, "ses_2");
+        assert_eq!(created.directory, "/tmp/project");
+
         let statuses = client.session_statuses().await.unwrap();
         assert_eq!(statuses.get("ses_1"), Some(&SessionStatus::Busy));
 
-        let messages = client.messages("ses_1", 10).await.unwrap();
+        let messages = client.messages("ses_1", "", 10).await.unwrap();
         assert_eq!(messages[0].text(), "done");
 
-        client.prompt_async("ses_1", "hello").await.unwrap();
+        client.prompt_async("ses_1", "", "hello").await.unwrap();
         assert_eq!(
             prompt_captured.lock().unwrap().as_ref().unwrap()["text"],
             "hello"
         );
 
-        client.abort("ses_1").await.unwrap();
+        client.abort("ses_1", "").await.unwrap();
+        client.compact_session("ses_1", "").await.unwrap();
 
         client
-            .reply_permission("ses_1", "per_1", PermissionReply::Once)
+            .reply_permission("ses_1", "", "per_1", PermissionReply::Once)
             .await
             .unwrap();
         assert_eq!(
@@ -1085,7 +1268,13 @@ mod integration_tests {
             }],
         };
         client
-            .reply_question("ses_1", "form_1", &request, vec![vec!["Fast".to_string()]])
+            .reply_question(
+                "ses_1",
+                "",
+                "form_1",
+                &request,
+                vec![vec!["Fast".to_string()]],
+            )
             .await
             .unwrap();
         assert_eq!(

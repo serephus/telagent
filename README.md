@@ -154,6 +154,8 @@ and interact with the bot. An empty list relies on the pairing code alone.
 ```text
 /bind CODE
 /unbind
+/new [DIRECTORY]
+/compact [ID]
 /sessions
 /use ID
 /status
@@ -166,11 +168,24 @@ and interact with the bot. An empty list relies on the pairing code alone.
 Reply to any notification to send feedback to that session. If no reply target
 is set, the active session from `/use` is used.
 
+Commands such as `/compact`, `/mute`, and `/abort` also use the replied
+notification's session when sent as a reply.
+
+`/new` creates a session and makes it active. Missing directories are created.
+Without a directory it uses the active session's directory, then
+`opencode.directory`, then the server default. Relative paths resolve against
+the active or configured directory, and `~/` expands to your home directory.
+
+`/compact` compacts the active session with its current model.
+
 Notifications also include inline buttons:
 
 - `Reply` selects the session for the next message.
 - `Mute` suppresses completion notifications for that session.
 - `Sessions` lists recent sessions.
+
+Completion notifications include the model and context usage when opencode
+reports it.
 
 ## Permissions and questions
 
@@ -188,9 +203,6 @@ with text. For multiple questions, send one answer per line.
 
 See `examples/config.toml`. The service uses
 `~/.local/state/telagent/state.redb` unless `storage.path` is set.
-
-State was moved from SQLite to redb. Existing `state.db` files are not migrated;
-re-run `telagent pair` after switching.
 
 Telegram connectivity can use a proxy:
 

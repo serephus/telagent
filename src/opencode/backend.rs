@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use futures_util::Stream;
 
 use crate::opencode::types::{
-    MessageWithParts, PermissionReply, PermissionRequest, QuestionRequest, RawEvent, SessionInfo,
-    SessionStatus,
+    MessageWithParts, PermissionReply, PermissionRequest, QuestionRequest, RawEvent,
+    SessionContext, SessionInfo, SessionStatus,
 };
 
 pub type EventStream = Pin<Box<dyn Stream<Item = anyhow::Result<RawEvent>> + Send>>;
@@ -16,21 +16,40 @@ pub trait OpenCodeBackend: Send + Sync {
 
     async fn list_sessions(&self) -> anyhow::Result<Vec<SessionInfo>>;
 
+    async fn get_session(&self, session_id: &str) -> anyhow::Result<Option<SessionInfo>>;
+
+    async fn create_session(&self, directory: &str) -> anyhow::Result<SessionInfo>;
+
+    async fn compact_session(&self, session_id: &str, directory: &str) -> anyhow::Result<()>;
+
+    async fn session_context(
+        &self,
+        session_id: &str,
+        directory: &str,
+    ) -> anyhow::Result<Option<SessionContext>>;
+
     async fn session_statuses(&self) -> anyhow::Result<HashMap<String, SessionStatus>>;
 
     async fn messages(
         &self,
         session_id: &str,
+        directory: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<MessageWithParts>>;
 
-    async fn prompt_async(&self, session_id: &str, text: &str) -> anyhow::Result<()>;
+    async fn prompt_async(
+        &self,
+        session_id: &str,
+        directory: &str,
+        text: &str,
+    ) -> anyhow::Result<()>;
 
-    async fn abort(&self, session_id: &str) -> anyhow::Result<()>;
+    async fn abort(&self, session_id: &str, directory: &str) -> anyhow::Result<()>;
 
     async fn reply_permission(
         &self,
         session_id: &str,
+        directory: &str,
         request_id: &str,
         reply: PermissionReply,
     ) -> anyhow::Result<()>;
@@ -38,6 +57,7 @@ pub trait OpenCodeBackend: Send + Sync {
     async fn reply_question(
         &self,
         session_id: &str,
+        directory: &str,
         request_id: &str,
         request: &QuestionRequest,
         answers: Vec<Vec<String>>,

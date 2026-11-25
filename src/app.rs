@@ -44,6 +44,19 @@ impl AppState {
                 .contains(&(user_id as i64))
     }
 
+    pub async fn session_directory(&self, session_id: &str) -> Result<String> {
+        if let Some(session) = self.db.get_session(&self.instance_id, session_id).await?
+            && !session.directory.is_empty()
+        {
+            return Ok(session.directory);
+        }
+        let Some(info) = self.backend.get_session(session_id).await? else {
+            return Ok(String::new());
+        };
+        let session = self.sync_session(&info, "").await?;
+        Ok(session.directory)
+    }
+
     pub async fn sync_session(&self, info: &SessionInfo, state: &str) -> Result<SessionRecord> {
         let existing = self.db.get_session(&self.instance_id, &info.id).await?;
 

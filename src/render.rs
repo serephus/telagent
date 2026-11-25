@@ -1,5 +1,5 @@
 use crate::{
-    opencode::types::{MessageWithParts, PermissionRequest, QuestionRequest},
+    opencode::types::{MessageWithParts, PermissionRequest, QuestionRequest, SessionContext},
     state::SessionRecord,
 };
 
@@ -36,17 +36,46 @@ pub fn session_title(session: &SessionRecord) -> &str {
     }
 }
 
-pub fn completion_message(session: &SessionRecord, body: Option<&str>) -> String {
+pub fn completion_message(
+    session: &SessionRecord,
+    body: Option<&str>,
+    context: Option<&SessionContext>,
+) -> String {
     let mut message = format!(
         "Session finished\nTitle: {}\nDirectory: {}",
         session_title(session),
         session.directory
     );
+    if let Some(context) = context {
+        if let Some(model) = &context.model {
+            message.push_str(&format!("\nModel: {model}"));
+        }
+        if let (Some(used), Some(limit)) = (context.used_tokens, context.context_limit)
+            && limit > 0
+        {
+            let percent = (used as f64 / limit as f64 * 100.0).round() as u64;
+            message.push_str(&format!(
+                "\nContext: {percent}% ({}/{})",
+                compact_tokens(used),
+                compact_tokens(limit)
+            ));
+        }
+    }
     if let Some(body) = body {
         message.push_str("\n\n");
         message.push_str(body.trim());
     }
     message
+}
+
+fn compact_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{}k", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
 }
 
 pub fn error_message(session: &SessionRecord, error: &str) -> String {
@@ -179,5 +208,31 @@ mod tests {
     #[test]
     fn truncate_is_char_safe() {
         assert_eq!(truncate("héllo", 3), "hél...");
+    }
+
+    #[test]
+    fn completion_message_includes_context() {
+        let session = SessionRecord {
+            instance_id: "instance".to_string(),
+            session_id: "ses_1".to_string(),
+            title: "Test".to_string(),
+            directory: "/tmp".to_string(),
+            project_id: None,
+            parent_id: None,
+            state: "idle".to_string(),
+            last_assistant_message_id: None,
+            last_notified_message_id: None,
+            muted: false,
+            updated_at: 0,
+        };
+        let context = SessionContext {
+            model: Some("gpt-5".to_string()),
+            used_tokens: Some(750_000),
+            context_limit: Some(1_000_000),
+        };
+
+        let message = completion_message(&session, None, Some(&context));
+        assert!(message.contains("Model: gpt-5"));
+        assert!(message.contains("Context: 75% (750k/1.0M)"));
     }
 }

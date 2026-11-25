@@ -83,6 +83,9 @@ async fn run_daemon(config: Config) -> Result<()> {
     tracing::info!(backend = backend.name(), "opencode backend ready");
     let token = config.bot_token()?;
     let bot = build_bot(token, config.telegram.proxy.as_deref())?;
+    if let Err(error) = telegram::commands::register(&bot).await {
+        tracing::warn!(%error, "failed to register Telegram commands");
+    }
     let paste = PasteClient::new(&config.notify.paste)?;
     let notifier = Notifier::new(
         bot.clone(),

@@ -6,12 +6,15 @@ use futures_util::StreamExt;
 use reqwest::{Client, RequestBuilder, StatusCode};
 use reqwest_eventsource::{Event, EventSource};
 use serde::{Serialize, de::DeserializeOwned};
+use serde_json::Value;
 
 use crate::{
     config::OpenCodeConfig,
     opencode::{
         backend::{EventStream, OpenCodeBackend},
-        types::{MessageWithParts, PermissionReply, RawEvent, SessionInfo, SessionStatus},
+        types::{
+            MessageWithParts, PermissionReply, RawEvent, SessionContext, SessionInfo, SessionStatus,
+        },
     },
 };
 
@@ -56,22 +59,62 @@ impl V1Http {
         request
     }
 
-    async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        let response = self.request(reqwest::Method::GET, path).send().await?;
+    async fn get_json<T: DeserializeOwned>(&self, path: &str, directory: &str) -> Result<T> {
+        let response = self
+            .request(reqwest::Method::GET, path)
+            .query(&directory_query(directory))
+            .send()
+            .await?;
         decode(response).await
     }
 
-    async fn post_json<B: Serialize>(&self, path: &str, body: &B) -> Result<()> {
+    async fn get_json_optional<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        directory: &str,
+    ) -> Result<Option<T>> {
+        let response = self
+            .request(reqwest::Method::GET, path)
+            .query(&directory_query(directory))
+            .send()
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        decode(response).await.map(Some)
+    }
+
+    async fn post_json<B: Serialize>(&self, path: &str, directory: &str, body: &B) -> Result<()> {
         let response = self
             .request(reqwest::Method::POST, path)
+            .query(&directory_query(directory))
             .json(body)
             .send()
             .await?;
         ensure_success(response).await
     }
 
-    async fn post_empty(&self, path: &str) -> Result<()> {
-        let response = self.request(reqwest::Method::POST, path).send().await?;
+    async fn post_json_decode<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        directory: &str,
+        body: &B,
+    ) -> Result<T> {
+        let response = self
+            .request(reqwest::Method::POST, path)
+            .query(&directory_query(directory))
+            .json(body)
+            .send()
+            .await?;
+        decode(response).await
+    }
+
+    async fn post_empty(&self, path: &str, directory: &str) -> Result<()> {
+        let response = self
+            .request(reqwest::Method::POST, path)
+            .query(&directory_query(directory))
+            .send()
+            .await?;
         ensure_success(response).await
     }
 
@@ -87,19 +130,113 @@ impl OpenCodeBackend for V1Http {
     }
 
     async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
-        self.get_json("/session").await
+        self.get_json("/session", "").await
     }
 
-    async fn session_statuses(&self) -> Result<HashMap<String, SessionStatus>> {
-        self.get_json("/session/status").await
-    }
-
-    async fn messages(&self, session_id: &str, limit: usize) -> Result<Vec<MessageWithParts>> {
-        self.get_json(&format!("/session/{session_id}/message?limit={limit}"))
+    async fn get_session(&self, session_id: &str) -> Result<Option<SessionInfo>> {
+        self.get_json_optional(&format!("/session/{session_id}"), "")
             .await
     }
 
-    async fn prompt_async(&self, session_id: &str, text: &str) -> Result<()> {
+    async fn create_session(&self, directory: &str) -> Result<SessionInfo> {
+        #[derive(Serialize)]
+        struct Body {}
+
+        self.post_json_decode("/session", directory, &Body {}).await
+    }
+
+    async fn compact_session(&self, session_id: &str, directory: &str) -> Result<()> {
+        let session = self
+            .get_session(session_id)
+            .await?
+            .context("session not found")?;
+        let model = session.model.context("session has no model")?;
+
+        #[derive(Serialize)]
+        struct Body {
+            #[serde(rename = "providerID")]
+            provider_id: String,
+            #[serde(rename = "modelID")]
+            model_id: String,
+        }
+
+        self.post_json(
+            &format!("/session/{session_id}/summarize"),
+            directory,
+            &Body {
+                provider_id: model.provider_id,
+                model_id: model.id,
+            },
+        )
+        .await
+    }
+
+    async fn session_context(
+        &self,
+        session_id: &str,
+        directory: &str,
+    ) -> Result<Option<SessionContext>> {
+        let Some(session) = self.get_session(session_id).await? else {
+            return Ok(None);
+        };
+
+        let messages = self.messages(session_id, directory, 10).await?;
+        let used_tokens = messages
+            .iter()
+            .filter(|message| message.is_assistant())
+            .max_by_key(|message| message.info.time.created)
+            .map(|message| message.info.tokens.total())
+            .filter(|tokens| *tokens > 0);
+
+        let model = session.model;
+        let context_limit = match &model {
+            Some(model) => {
+                let providers: Value = self.get_json("/config/providers", "").await?;
+                providers
+                    .get("providers")
+                    .and_then(Value::as_array)
+                    .and_then(|providers| {
+                        providers
+                            .iter()
+                            .find(|provider| {
+                                provider.get("id").and_then(Value::as_str)
+                                    == Some(model.provider_id.as_str())
+                            })
+                            .and_then(|provider| provider.get("models"))
+                            .and_then(|models| models.get(&model.id))
+                            .and_then(|model| model.get("limit"))
+                            .and_then(|limit| limit.get("context"))
+                            .and_then(Value::as_u64)
+                    })
+            }
+            None => None,
+        };
+
+        Ok(Some(SessionContext {
+            model: model.map(|model| model.id),
+            used_tokens,
+            context_limit,
+        }))
+    }
+
+    async fn session_statuses(&self) -> Result<HashMap<String, SessionStatus>> {
+        self.get_json("/session/status", "").await
+    }
+
+    async fn messages(
+        &self,
+        session_id: &str,
+        directory: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageWithParts>> {
+        self.get_json(
+            &format!("/session/{session_id}/message?limit={limit}"),
+            directory,
+        )
+        .await
+    }
+
+    async fn prompt_async(&self, session_id: &str, directory: &str, text: &str) -> Result<()> {
         #[derive(Serialize)]
         struct TextPart<'a> {
             #[serde(rename = "type")]
@@ -115,18 +252,23 @@ impl OpenCodeBackend for V1Http {
         let body = Body {
             parts: vec![TextPart { kind: "text", text }],
         };
-        self.post_json(&format!("/session/{session_id}/prompt_async"), &body)
-            .await
+        self.post_json(
+            &format!("/session/{session_id}/prompt_async"),
+            directory,
+            &body,
+        )
+        .await
     }
 
-    async fn abort(&self, session_id: &str) -> Result<()> {
-        self.post_empty(&format!("/session/{session_id}/abort"))
+    async fn abort(&self, session_id: &str, directory: &str) -> Result<()> {
+        self.post_empty(&format!("/session/{session_id}/abort"), directory)
             .await
     }
 
     async fn reply_permission(
         &self,
         _session_id: &str,
+        directory: &str,
         request_id: &str,
         reply: PermissionReply,
     ) -> Result<()> {
@@ -136,6 +278,7 @@ impl OpenCodeBackend for V1Http {
         }
         self.post_json(
             &format!("/permission/{request_id}/reply"),
+            directory,
             &Body {
                 reply: reply.as_str(),
             },
@@ -146,6 +289,7 @@ impl OpenCodeBackend for V1Http {
     async fn reply_question(
         &self,
         _session_id: &str,
+        directory: &str,
         request_id: &str,
         _request: &crate::opencode::types::QuestionRequest,
         answers: Vec<Vec<String>>,
@@ -154,8 +298,12 @@ impl OpenCodeBackend for V1Http {
         struct Body {
             answers: Vec<Vec<String>>,
         }
-        self.post_json(&format!("/question/{request_id}/reply"), &Body { answers })
-            .await
+        self.post_json(
+            &format!("/question/{request_id}/reply"),
+            directory,
+            &Body { answers },
+        )
+        .await
     }
 
     async fn event_stream(&self) -> Result<EventStream> {
@@ -191,6 +339,14 @@ impl OpenCodeBackend for V1Http {
 
     fn normalize_event(&self, raw: RawEvent) -> crate::opencode::backend::AgentEvent {
         crate::opencode::backend::normalize_v1_event(raw)
+    }
+}
+
+fn directory_query(directory: &str) -> Vec<(&str, &str)> {
+    if directory.is_empty() {
+        Vec::new()
+    } else {
+        vec![("directory", directory)]
     }
 }
 
@@ -261,6 +417,14 @@ mod tests {
                         "directory": "/tmp",
                         "projectID": "prj_1"
                     }]))
+                })
+                .post(|| async {
+                    Json(json!({
+                        "id": "ses_2",
+                        "title": "New session",
+                        "directory": "/tmp/project",
+                        "projectID": "prj_1"
+                    }))
                 }),
             )
             .route(
@@ -315,6 +479,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwards_directory_to_permission_reply() {
+        use std::collections::HashMap;
+
+        use axum::{extract::Query, routing::post};
+
+        let captured = Arc::new(Mutex::new(None));
+        let handler_state = captured.clone();
+        let router = Router::new().route(
+            "/permission/{request_id}/reply",
+            post(move |Query(query): Query<HashMap<String, String>>| {
+                let captured = handler_state.clone();
+                async move {
+                    *captured.lock().unwrap() = Some(query);
+                    AxumStatus::OK
+                }
+            }),
+        );
+        let url = spawn(router).await;
+        let config = OpenCodeConfig {
+            url,
+            ..Default::default()
+        };
+        let client = V1Http::new(&config).unwrap();
+
+        client
+            .reply_permission("ses_1", "/tmp/project", "per_1", PermissionReply::Once)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            captured
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get("directory")
+                .map(String::as_str),
+            Some("/tmp/project")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetches_session_by_id() {
+        let router = Router::new().route(
+            "/session/{session_id}",
+            get(|| async {
+                Json(json!({
+                    "id": "ses_1",
+                    "title": "Test session",
+                    "directory": "/tmp/project"
+                }))
+            }),
+        );
+        let url = spawn(router).await;
+        let config = OpenCodeConfig {
+            url,
+            ..Default::default()
+        };
+        let client = V1Http::new(&config).unwrap();
+
+        let session = client.get_session("ses_1").await.unwrap().unwrap();
+        assert_eq!(session.id, "ses_1");
+        assert_eq!(session.directory, "/tmp/project");
+    }
+
+    #[tokio::test]
+    async fn compacts_session() {
+        let captured = Arc::new(Mutex::new(None));
+        let handler_state = captured.clone();
+        let summarize = post(move |Json(body): Json<Value>| {
+            let captured = handler_state.clone();
+            async move {
+                *captured.lock().unwrap() = Some(body);
+                AxumStatus::OK
+            }
+        });
+        let router = Router::new()
+            .route(
+                "/session/{session_id}",
+                get(|| async {
+                    Json(json!({
+                        "id": "ses_1",
+                        "title": "Test session",
+                        "directory": "/tmp/project",
+                        "model": {"id": "gpt-5", "providerID": "openai"}
+                    }))
+                }),
+            )
+            .route("/session/{session_id}/summarize", summarize);
+        let url = spawn(router).await;
+        let config = OpenCodeConfig {
+            url,
+            ..Default::default()
+        };
+        let client = V1Http::new(&config).unwrap();
+
+        client
+            .compact_session("ses_1", "/tmp/project")
+            .await
+            .unwrap();
+        let body = captured.lock().unwrap();
+        let body = body.as_ref().unwrap();
+        assert_eq!(body["providerID"], "openai");
+        assert_eq!(body["modelID"], "gpt-5");
+    }
+
+    #[tokio::test]
+    async fn reads_session_context_usage() {
+        let router = Router::new()
+            .route(
+                "/session/{session_id}",
+                get(|| async {
+                    Json(json!({
+                        "id": "ses_1",
+                        "title": "Test session",
+                        "directory": "/tmp/project",
+                        "model": {"id": "gpt-5", "providerID": "openai"}
+                    }))
+                }),
+            )
+            .route(
+                "/session/{session_id}/message",
+                get(|| async {
+                    Json(json!([{
+                        "info": {
+                            "id": "msg_1",
+                            "role": "assistant",
+                            "time": {"created": 1, "completed": 2},
+                            "tokens": {
+                                "total": 750000,
+                                "input": 750000,
+                                "output": 0,
+                                "reasoning": 0,
+                                "cache": {"read": 0, "write": 0}
+                            }
+                        },
+                        "parts": [{"type": "text", "text": "done"}]
+                    }]))
+                }),
+            )
+            .route(
+                "/config/providers",
+                get(|| async {
+                    Json(json!({
+                        "providers": [{
+                            "id": "openai",
+                            "models": {
+                                "gpt-5": {"limit": {"context": 1000000}}
+                            }
+                        }]
+                    }))
+                }),
+            );
+        let url = spawn(router).await;
+        let config = OpenCodeConfig {
+            url,
+            ..Default::default()
+        };
+        let client = V1Http::new(&config).unwrap();
+
+        let context = client
+            .session_context("ses_1", "/tmp/project")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.model.as_deref(), Some("gpt-5"));
+        assert_eq!(context.used_tokens, Some(750_000));
+        assert_eq!(context.context_limit, Some(1_000_000));
+    }
+
+    #[tokio::test]
     async fn talks_to_v1_api() {
         let (router, captured) = app();
         let url = spawn(router).await;
@@ -328,25 +663,30 @@ mod tests {
         assert_eq!(sessions[0].id, "ses_1");
         assert_eq!(sessions[0].title, "Test session");
 
+        let created = client.create_session("/tmp/project").await.unwrap();
+        assert_eq!(created.id, "ses_2");
+        assert_eq!(created.directory, "/tmp/project");
+
         let statuses = client.session_statuses().await.unwrap();
         assert_eq!(statuses.get("ses_1"), Some(&SessionStatus::Busy));
 
-        let messages = client.messages("ses_1", 10).await.unwrap();
+        let messages = client.messages("ses_1", "", 10).await.unwrap();
         assert_eq!(messages[0].text(), "done");
 
-        client.prompt_async("ses_1", "hello").await.unwrap();
+        client.prompt_async("ses_1", "", "hello").await.unwrap();
         assert_eq!(
             captured.lock().unwrap().as_ref().unwrap()["parts"][0]["text"],
             "hello"
         );
 
         client
-            .reply_permission("ses_1", "per_1", PermissionReply::Once)
+            .reply_permission("ses_1", "", "per_1", PermissionReply::Once)
             .await
             .unwrap();
         client
             .reply_question(
                 "ses_1",
+                "",
                 "que_1",
                 &QuestionRequest {
                     id: "que_1".to_string(),

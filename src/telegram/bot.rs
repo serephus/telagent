@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use teloxide::{
@@ -70,7 +70,25 @@ async fn handle_message(bot: &Bot, state: &AppState, message: &Message) -> Resul
     if let Some(text) = message.text()
         && let Some((command, args)) = parse_command(text)
     {
-        handle_command(bot, state, message, command, &args, bound).await?;
+        let reply_session_id = match message.reply_to_message() {
+            Some(reply) => {
+                state
+                    .db
+                    .session_for_telegram_message(chat_id.0, reply.id.0)
+                    .await?
+            }
+            None => None,
+        };
+        handle_command(
+            bot,
+            state,
+            message,
+            command,
+            &args,
+            bound,
+            reply_session_id.as_deref(),
+        )
+        .await?;
         return Ok(());
     }
 
@@ -133,18 +151,14 @@ async fn handle_command(
     command: &str,
     args: &[&str],
     bound: bool,
+    reply_session_id: Option<&str>,
 ) -> Result<()> {
     let chat_id = message.chat.id;
     let user_id = message.from.as_ref().map(|user| user.id.0).unwrap_or(0);
 
     match command {
         "start" | "help" => {
-            send(
-                bot,
-                chat_id,
-                "telagent\n\nCommands:\n/bind CODE\n/unbind\n/sessions\n/use ID\n/status\n/mute [ID]\n/unmute [ID]\n/abort [ID]\n/help\n\nReply to a notification to send feedback.",
-            )
-            .await?;
+            send(bot, chat_id, crate::telegram::commands::help_text()).await?;
         }
         "bind" => {
             let Some(code) = args.first() else {
@@ -184,6 +198,103 @@ async fn handle_command(
             state.db.unbind(chat_id.0).await?;
             send(bot, chat_id, "Unbound this chat.").await?;
         }
+        "new" => {
+            let requested = args.join(" ");
+            let requested = requested.trim();
+            let active_directory = match state.db.active_session(chat_id.0).await? {
+                Some(session_id) => state.session_directory(&session_id).await?,
+                None => String::new(),
+            };
+            let configured_directory = state
+                .config
+                .opencode
+                .directory
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let directory = if requested.is_empty() {
+                if !active_directory.is_empty() {
+                    PathBuf::from(active_directory)
+                } else if !configured_directory.is_empty() {
+                    PathBuf::from(configured_directory)
+                } else {
+                    PathBuf::new()
+                }
+            } else {
+                let base = if !active_directory.is_empty() {
+                    active_directory
+                } else if !configured_directory.is_empty() {
+                    configured_directory
+                } else {
+                    std::env::current_dir()?.to_string_lossy().into_owned()
+                };
+                resolve_directory(requested, &base)
+            };
+            let directory = if directory.as_os_str().is_empty() || directory.is_absolute() {
+                directory
+            } else {
+                std::env::current_dir()?.join(directory)
+            };
+            let directory = directory.to_string_lossy().into_owned();
+            if !directory.is_empty()
+                && let Err(error) = std::fs::create_dir_all(&directory)
+            {
+                send(
+                    bot,
+                    chat_id,
+                    format!("Failed to create directory {directory}: {error}"),
+                )
+                .await?;
+                return Ok(());
+            }
+            match state.backend.create_session(&directory).await {
+                Ok(info) => {
+                    let session = state.sync_session(&info, "idle").await?;
+                    state
+                        .db
+                        .set_active_session(chat_id.0, &session.session_id)
+                        .await?;
+                    send(
+                        bot,
+                        chat_id,
+                        format!(
+                            "Started session {}\n{}",
+                            session.session_id,
+                            if session.title.is_empty() {
+                                session.directory.clone()
+                            } else {
+                                session.title.clone()
+                            }
+                        ),
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    send(bot, chat_id, format!("Failed to start session: {error}")).await?;
+                }
+            }
+        }
+        "compact" => {
+            let Some(session_id) =
+                resolve_session_id(state, chat_id.0, args, reply_session_id).await?
+            else {
+                send(bot, chat_id, "No active session. Pass a session ID.").await?;
+                return Ok(());
+            };
+            send(bot, chat_id, format!("Compacting {session_id}...")).await?;
+            match state
+                .backend
+                .compact_session(&session_id, &state.session_directory(&session_id).await?)
+                .await
+            {
+                Ok(()) => {
+                    send(bot, chat_id, format!("Compacted {session_id}.")).await?;
+                }
+                Err(error) => {
+                    send(bot, chat_id, format!("Compaction failed: {error}")).await?;
+                }
+            }
+        }
         "sessions" => {
             send_sessions(bot, state, chat_id).await?;
         }
@@ -209,7 +320,9 @@ async fn handle_command(
             }
         }
         "mute" | "unmute" => {
-            let Some(session_id) = resolve_session_id(state, chat_id.0, args).await? else {
+            let Some(session_id) =
+                resolve_session_id(state, chat_id.0, args, reply_session_id).await?
+            else {
                 send(bot, chat_id, "No active session. Pass a session ID.").await?;
                 return Ok(());
             };
@@ -226,11 +339,17 @@ async fn handle_command(
             .await?;
         }
         "abort" => {
-            let Some(session_id) = resolve_session_id(state, chat_id.0, args).await? else {
+            let Some(session_id) =
+                resolve_session_id(state, chat_id.0, args, reply_session_id).await?
+            else {
                 send(bot, chat_id, "No active session. Pass a session ID.").await?;
                 return Ok(());
             };
-            match state.backend.abort(&session_id).await {
+            match state
+                .backend
+                .abort(&session_id, &state.session_directory(&session_id).await?)
+                .await
+            {
                 Ok(()) => {
                     send(bot, chat_id, format!("Aborted {session_id}.")).await?;
                 }
@@ -320,7 +439,12 @@ async fn handle_callback(bot: &Bot, state: &AppState, callback: &CallbackQuery) 
             }
             match state
                 .backend
-                .reply_permission(&pending.session_id, request_id, reply)
+                .reply_permission(
+                    &pending.session_id,
+                    &state.session_directory(&pending.session_id).await?,
+                    request_id,
+                    reply,
+                )
                 .await
             {
                 Ok(()) => {
@@ -382,7 +506,13 @@ async fn handle_callback(bot: &Bot, state: &AppState, callback: &CallbackQuery) 
                 vec![option.value.clone().unwrap_or_else(|| option.label.clone())];
             match state
                 .backend
-                .reply_question(&pending.session_id, request_id, &request, answers)
+                .reply_question(
+                    &pending.session_id,
+                    &state.session_directory(&pending.session_id).await?,
+                    request_id,
+                    &request,
+                    answers,
+                )
                 .await
             {
                 Ok(()) => {
@@ -422,7 +552,12 @@ async fn send_feedback(
     session_id: &str,
     text: &str,
 ) -> Result<()> {
-    match state.backend.prompt_async(session_id, text).await {
+    let directory = state.session_directory(session_id).await?;
+    match state
+        .backend
+        .prompt_async(session_id, &directory, text)
+        .await
+    {
         Ok(()) => {
             send(bot, chat_id, format!("Sent to {session_id}.")).await?;
         }
@@ -495,7 +630,13 @@ async fn answer_pending_question(
 
     match state
         .backend
-        .reply_question(&pending.session_id, &pending.request_id, &request, answers)
+        .reply_question(
+            &pending.session_id,
+            &state.session_directory(&pending.session_id).await?,
+            &pending.request_id,
+            &request,
+            answers,
+        )
         .await
     {
         Ok(()) => {
@@ -537,11 +678,32 @@ async fn resolve_session_id(
     state: &AppState,
     chat_id: i64,
     args: &[&str],
+    reply_session_id: Option<&str>,
 ) -> Result<Option<String>> {
     if let Some(session_id) = args.first() {
         return Ok(Some((*session_id).to_string()));
     }
+    if let Some(session_id) = reply_session_id {
+        return Ok(Some(session_id.to_string()));
+    }
     state.db.active_session(chat_id).await
+}
+
+fn resolve_directory(requested: &str, base: &str) -> PathBuf {
+    let expanded = if requested == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(requested))
+    } else if let Some(rest) = requested.strip_prefix("~/") {
+        dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(requested))
+    } else {
+        PathBuf::from(requested)
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        PathBuf::from(base).join(expanded)
+    }
 }
 
 async fn send(bot: &Bot, chat_id: ChatId, text: impl Into<String>) -> Result<()> {
@@ -561,4 +723,25 @@ fn parse_command(text: &str) -> Option<(&str, Vec<&str>)> {
     let mut parts = rest.split_whitespace();
     let command = parts.next()?.split('@').next().unwrap_or("");
     Some((command, parts.collect()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_relative_directory_under_base() {
+        assert_eq!(
+            resolve_directory("project", "/tmp/base"),
+            PathBuf::from("/tmp/base/project")
+        );
+    }
+
+    #[test]
+    fn resolves_absolute_directory_as_is() {
+        assert_eq!(
+            resolve_directory("/tmp/project", "/tmp/base"),
+            PathBuf::from("/tmp/project")
+        );
+    }
 }

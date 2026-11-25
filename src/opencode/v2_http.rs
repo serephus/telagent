@@ -14,8 +14,8 @@ use crate::{
         backend::{AgentEvent, EventStream, OpenCodeBackend},
         types::{
             CacheTokens, MessageInfo, MessageTime, MessageTokens, MessageWithParts, Part,
-            PermissionReply, PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest,
-            RawEvent, SessionContext, SessionInfo, SessionModel, SessionStatus,
+            PermissionReply, PermissionRequest, QuestionRequest, RawEvent, SessionContext,
+            SessionInfo, SessionModel, SessionStatus,
         },
     },
 };
@@ -352,10 +352,21 @@ impl OpenCodeBackend for V2Http {
     async fn prompt_async(&self, session_id: &str, _directory: &str, text: &str) -> Result<()> {
         #[derive(serde::Serialize)]
         struct Body<'a> {
+            prompt: Prompt<'a>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct Prompt<'a> {
             text: &'a str,
         }
-        self.post_json(&format!("/api/session/{session_id}/prompt"), &Body { text })
-            .await
+
+        self.post_json(
+            &format!("/api/session/{session_id}/prompt"),
+            &Body {
+                prompt: Prompt { text },
+            },
+        )
+        .await
     }
 
     async fn abort(&self, session_id: &str, _directory: &str) -> Result<()> {
@@ -372,12 +383,12 @@ impl OpenCodeBackend for V2Http {
     ) -> Result<()> {
         #[derive(serde::Serialize)]
         struct Body<'a> {
-            decision: &'a str,
+            reply: &'a str,
         }
         self.post_json(
             &format!("/api/session/{session_id}/permission/{request_id}/reply"),
             &Body {
-                decision: reply.as_str(),
+                reply: reply.as_str(),
             },
         )
         .await
@@ -391,20 +402,31 @@ impl OpenCodeBackend for V2Http {
         request: &QuestionRequest,
         answers: Vec<Vec<String>>,
     ) -> Result<()> {
-        let mut answer = serde_json::Map::new();
-        for (index, question) in request.questions.iter().enumerate() {
-            let key = question
-                .key
-                .clone()
-                .unwrap_or_else(|| format!("field{index}"));
-            let values = answers.get(index).cloned().unwrap_or_default();
-            let value = form_value(question, values);
-            answer.insert(key, value);
-        }
+        let answers = answers
+            .into_iter()
+            .enumerate()
+            .map(|(index, values)| {
+                let question = request.questions.get(index);
+                values
+                    .into_iter()
+                    .map(|value| {
+                        question
+                            .and_then(|question| {
+                                question
+                                    .options
+                                    .iter()
+                                    .find(|option| option.value.as_deref() == Some(value.as_str()))
+                            })
+                            .map(|option| option.label.clone())
+                            .unwrap_or(value)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
 
         self.post_json(
-            &format!("/api/session/{session_id}/form/{request_id}/reply"),
-            &json!({ "answer": answer }),
+            &format!("/api/session/{session_id}/question/{request_id}/reply"),
+            &json!({ "answers": answers }),
         )
         .await
     }
@@ -602,8 +624,14 @@ fn number_to_i64(value: &Value) -> Option<i64> {
 pub fn normalize_v2_event(raw: RawEvent) -> AgentEvent {
     let data = &raw.properties;
     match raw.event_type.as_str() {
-        "session.created" => session_info_from_v2(data)
-            .map(AgentEvent::SessionCreated)
+        "session.created" | "session.updated" => session_info_from_v2(data)
+            .map(|info| {
+                if raw.event_type == "session.created" {
+                    AgentEvent::SessionCreated(info)
+                } else {
+                    AgentEvent::SessionUpdated(info)
+                }
+            })
             .unwrap_or(AgentEvent::Other(raw.event_type)),
         "session.deleted" => data
             .get("sessionID")
@@ -645,7 +673,7 @@ pub fn normalize_v2_event(raw: RawEvent) -> AgentEvent {
                 status: SessionStatus::Idle,
             })
             .unwrap_or(AgentEvent::Other(raw.event_type)),
-        "session.execution.failed" => {
+        "session.error" | "session.execution.failed" => {
             let session_id = data.get("sessionID").and_then(Value::as_str);
             let message = data
                 .get("error")
@@ -660,10 +688,10 @@ pub fn normalize_v2_event(raw: RawEvent) -> AgentEvent {
                 })
                 .unwrap_or(AgentEvent::Other(raw.event_type))
         }
-        "permission.asked" => permission_from_v2(data)
+        "permission.asked" | "permission.v2.asked" => permission_request_from_v2(data)
             .map(AgentEvent::PermissionAsked)
             .unwrap_or(AgentEvent::Other(raw.event_type)),
-        "permission.replied" => AgentEvent::PermissionReplied {
+        "permission.replied" | "permission.v2.replied" => AgentEvent::PermissionReplied {
             session_id: data
                 .get("sessionID")
                 .and_then(Value::as_str)
@@ -680,15 +708,17 @@ pub fn normalize_v2_event(raw: RawEvent) -> AgentEvent {
                 .unwrap_or_default()
                 .to_string(),
         },
-        "form.created" => data
-            .get("form")
-            .and_then(form_to_question)
-            .map(AgentEvent::QuestionAsked)
-            .unwrap_or(AgentEvent::Other(raw.event_type)),
-        "form.replied" | "form.cancelled" => {
+        "question.asked" | "question.v2.asked" => {
+            serde_json::from_value::<QuestionRequest>(data.clone())
+                .map(AgentEvent::QuestionAsked)
+                .unwrap_or(AgentEvent::Other(raw.event_type))
+        }
+        "question.replied"
+        | "question.rejected"
+        | "question.v2.replied"
+        | "question.v2.rejected" => {
             let request_id = data
-                .get("id")
-                .or_else(|| data.get("formID"))
+                .get("requestID")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
@@ -706,34 +736,51 @@ pub fn normalize_v2_event(raw: RawEvent) -> AgentEvent {
 }
 
 fn session_info_from_v2(data: &Value) -> Option<SessionInfo> {
+    let info = data.get("info").unwrap_or(data);
+    let id = info
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| data.get("sessionID").and_then(Value::as_str))?;
     Some(SessionInfo {
-        id: data.get("sessionID")?.as_str()?.to_string(),
-        title: data
+        id: id.to_string(),
+        title: info
             .get("title")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        directory: data
-            .get("location")
-            .and_then(|location| location.get("directory"))
+        directory: info
+            .get("directory")
             .and_then(Value::as_str)
+            .or_else(|| {
+                info.get("location")
+                    .and_then(|location| location.get("directory"))
+                    .and_then(Value::as_str)
+            })
             .unwrap_or_default()
             .to_string(),
-        project_id: data
+        project_id: info
             .get("projectID")
             .and_then(Value::as_str)
             .map(str::to_string),
-        parent_id: data
+        parent_id: info
             .get("parentID")
             .and_then(Value::as_str)
             .map(str::to_string),
-        model: data.get("model").and_then(|model| {
-            Some(SessionModel {
-                id: model.get("id")?.as_str()?.to_string(),
-                provider_id: model.get("providerID")?.as_str()?.to_string(),
-            })
-        }),
+        model: info.get("model").and_then(session_model_from_v2),
     })
+}
+
+fn session_model_from_v2(model: &Value) -> Option<SessionModel> {
+    Some(SessionModel {
+        id: model.get("id")?.as_str()?.to_string(),
+        provider_id: model.get("providerID")?.as_str()?.to_string(),
+    })
+}
+
+fn permission_request_from_v2(data: &Value) -> Option<PermissionRequest> {
+    serde_json::from_value(data.clone())
+        .ok()
+        .or_else(|| permission_from_v2(data))
 }
 
 fn permission_from_v2(data: &Value) -> Option<PermissionRequest> {
@@ -749,126 +796,6 @@ fn permission_from_v2(data: &Value) -> Option<PermissionRequest> {
         metadata: data.get("metadata").cloned().unwrap_or(Value::Null),
         always: string_array(data.get("save")),
     })
-}
-
-fn form_to_question(value: &Value) -> Option<QuestionRequest> {
-    let id = value.get("id")?.as_str()?.to_string();
-    let session_id = value.get("sessionID")?.as_str()?.to_string();
-    let questions = value
-        .get("fields")
-        .and_then(Value::as_array)
-        .map(|fields| fields.iter().filter_map(field_to_question).collect())
-        .unwrap_or_default();
-    Some(QuestionRequest {
-        id,
-        session_id,
-        questions,
-    })
-}
-
-fn field_to_question(field: &Value) -> Option<QuestionInfo> {
-    let key = field.get("key")?.as_str()?.to_string();
-    let input_type = field
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("string")
-        .to_string();
-    let title = field.get("title").and_then(Value::as_str).unwrap_or(&key);
-    let question = match field.get("description").and_then(Value::as_str) {
-        Some(description) if !description.trim().is_empty() => {
-            format!("{title}\n{description}")
-        }
-        _ => title.to_string(),
-    };
-
-    let mut options = field
-        .get("options")
-        .and_then(Value::as_array)
-        .map(|options| {
-            options
-                .iter()
-                .filter_map(|option| {
-                    Some(QuestionOption {
-                        label: option.get("label").and_then(Value::as_str)?.to_string(),
-                        description: option
-                            .get("description")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        value: option
-                            .get("value")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    if input_type == "boolean" && options.is_empty() {
-        options = vec![
-            QuestionOption {
-                label: "true".to_string(),
-                description: None,
-                value: Some("true".to_string()),
-            },
-            QuestionOption {
-                label: "false".to_string(),
-                description: None,
-                value: Some("false".to_string()),
-            },
-        ];
-    }
-
-    let multiple = input_type == "multiselect";
-    let custom = options.is_empty() && input_type != "boolean";
-
-    Some(QuestionInfo {
-        question,
-        header: key.clone(),
-        options,
-        multiple,
-        custom,
-        key: Some(key),
-        input_type: Some(input_type),
-    })
-}
-
-fn form_value(question: &QuestionInfo, values: Vec<String>) -> Value {
-    let values = values
-        .into_iter()
-        .map(|value| {
-            question
-                .options
-                .iter()
-                .find(|option| option.label == value)
-                .and_then(|option| option.value.clone())
-                .unwrap_or(value)
-        })
-        .collect::<Vec<_>>();
-
-    match question.input_type.as_deref() {
-        Some("boolean") => Value::Bool(
-            values
-                .first()
-                .map(|value| value.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
-        ),
-        Some("integer") => values
-            .first()
-            .and_then(|value| value.parse::<i64>().ok())
-            .map(|value| json!(value))
-            .unwrap_or_else(|| Value::String(values.first().cloned().unwrap_or_default())),
-        Some("number") => values
-            .first()
-            .and_then(|value| value.parse::<f64>().ok())
-            .and_then(serde_json::Number::from_f64)
-            .map(Value::Number)
-            .unwrap_or_else(|| Value::String(values.first().cloned().unwrap_or_default())),
-        _ if question.multiple || values.len() > 1 => {
-            Value::Array(values.into_iter().map(Value::String).collect())
-        }
-        _ => Value::String(values.first().cloned().unwrap_or_default()),
-    }
 }
 
 fn string_array(value: Option<&Value>) -> Vec<String> {
@@ -930,81 +857,81 @@ mod tests {
     }
 
     #[test]
-    fn maps_v2_form_to_questions() {
+    fn maps_v2_question_event() {
         let raw = RawEvent {
-            event_type: "form.created".to_string(),
+            event_type: "question.asked".to_string(),
             properties: json!({
-                "form": {
-                    "id": "form_1",
-                    "sessionID": "ses_1",
-                    "title": "Choose",
-                    "fields": [
-                        {
-                            "key": "mode",
-                            "type": "string",
-                            "title": "Mode",
-                            "options": [
-                                {"value": "fast", "label": "Fast"},
-                                {"value": "safe", "label": "Safe"}
-                            ]
-                        }
-                    ]
-                }
+                "id": "que_1",
+                "sessionID": "ses_1",
+                "questions": [
+                    {
+                        "question": "Which mode?",
+                        "header": "mode",
+                        "options": [
+                            {"label": "Fast", "description": "Fast mode"},
+                            {"label": "Safe", "description": "Safe mode"}
+                        ]
+                    }
+                ]
             }),
         };
         match normalize_v2_event(raw) {
             AgentEvent::QuestionAsked(request) => {
-                assert_eq!(request.id, "form_1");
-                assert_eq!(request.questions[0].key.as_deref(), Some("mode"));
-                assert_eq!(
-                    request.questions[0].options[0].value.as_deref(),
-                    Some("fast")
-                );
+                assert_eq!(request.id, "que_1");
+                assert_eq!(request.questions[0].header, "mode");
+                assert_eq!(request.questions[0].options[0].label, "Fast");
             }
             other => panic!("unexpected event: {other:?}"),
         }
     }
 
     #[test]
-    fn builds_typed_form_values() {
-        let question = QuestionInfo {
-            question: "Enabled?".to_string(),
-            header: "enabled".to_string(),
-            options: Vec::new(),
-            multiple: false,
-            custom: false,
-            key: Some("enabled".to_string()),
-            input_type: Some("boolean".to_string()),
+    fn maps_v2_v1_permission_event() {
+        let raw = RawEvent {
+            event_type: "permission.asked".to_string(),
+            properties: json!({
+                "id": "per_1",
+                "sessionID": "ses_1",
+                "permission": "read",
+                "patterns": ["/tmp/.env"],
+                "metadata": {},
+                "always": ["/tmp/.env"]
+            }),
         };
-        assert_eq!(form_value(&question, vec!["true".to_string()]), json!(true));
+        match normalize_v2_event(raw) {
+            AgentEvent::PermissionAsked(request) => {
+                assert_eq!(request.id, "per_1");
+                assert_eq!(request.permission, "read");
+                assert_eq!(request.patterns, vec!["/tmp/.env"]);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]
-    fn maps_multiselect_values() {
-        let question = QuestionInfo {
-            question: "Modes".to_string(),
-            header: "modes".to_string(),
-            options: vec![
-                QuestionOption {
-                    label: "Fast".to_string(),
-                    description: None,
-                    value: Some("fast".to_string()),
-                },
-                QuestionOption {
-                    label: "Safe".to_string(),
-                    description: None,
-                    value: Some("safe".to_string()),
-                },
-            ],
-            multiple: true,
-            custom: false,
-            key: Some("modes".to_string()),
-            input_type: Some("multiselect".to_string()),
+    fn normalizes_v2_session_event() {
+        let raw = RawEvent {
+            event_type: "session.updated".to_string(),
+            properties: json!({
+                "sessionID": "ses_1",
+                "info": {
+                    "id": "ses_1",
+                    "title": "Test session",
+                    "directory": "/tmp/project",
+                    "projectID": "global",
+                    "model": {"id": "gpt-5", "providerID": "openai"}
+                }
+            }),
         };
-        assert_eq!(
-            form_value(&question, vec!["Fast".to_string(), "Safe".to_string()]),
-            json!(["fast", "safe"])
-        );
+        match normalize_v2_event(raw) {
+            AgentEvent::SessionUpdated(session) => {
+                assert_eq!(session.id, "ses_1");
+                assert_eq!(session.title, "Test session");
+                assert_eq!(session.directory, "/tmp/project");
+                assert_eq!(session.model.unwrap().id, "gpt-5");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]
@@ -1085,7 +1012,10 @@ mod integration_tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::config::OpenCodeConfig;
+    use crate::{
+        config::OpenCodeConfig,
+        opencode::types::{QuestionInfo, QuestionOption},
+    };
 
     type Captured = Arc<Mutex<Option<Value>>>;
 
@@ -1192,7 +1122,10 @@ mod integration_tests {
                 "/api/session/{session_id}/permission/{request_id}/reply",
                 permission,
             )
-            .route("/api/session/{session_id}/form/{form_id}/reply", form);
+            .route(
+                "/api/session/{session_id}/question/{request_id}/reply",
+                form,
+            );
 
         (router, prompt_captured, form_captured, permission_captured)
     }
@@ -1234,7 +1167,7 @@ mod integration_tests {
 
         client.prompt_async("ses_1", "", "hello").await.unwrap();
         assert_eq!(
-            prompt_captured.lock().unwrap().as_ref().unwrap()["text"],
+            prompt_captured.lock().unwrap().as_ref().unwrap()["prompt"]["text"],
             "hello"
         );
 
@@ -1246,12 +1179,12 @@ mod integration_tests {
             .await
             .unwrap();
         assert_eq!(
-            permission_captured.lock().unwrap().as_ref().unwrap()["decision"],
+            permission_captured.lock().unwrap().as_ref().unwrap()["reply"],
             "once"
         );
 
         let request = QuestionRequest {
-            id: "form_1".to_string(),
+            id: "que_1".to_string(),
             session_id: "ses_1".to_string(),
             questions: vec![QuestionInfo {
                 question: "Mode".to_string(),
@@ -1271,15 +1204,15 @@ mod integration_tests {
             .reply_question(
                 "ses_1",
                 "",
-                "form_1",
+                "que_1",
                 &request,
-                vec![vec!["Fast".to_string()]],
+                vec![vec!["fast".to_string()]],
             )
             .await
             .unwrap();
         assert_eq!(
-            form_captured.lock().unwrap().as_ref().unwrap()["answer"]["mode"],
-            "fast"
+            form_captured.lock().unwrap().as_ref().unwrap()["answers"][0][0],
+            "Fast"
         );
 
         let mut stream = client.event_stream().await.unwrap();

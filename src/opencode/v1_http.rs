@@ -472,8 +472,10 @@ mod tests {
 
     #[test]
     fn trims_base_url() {
-        let mut config = OpenCodeConfig::default();
-        config.url = "http://127.0.0.1:4096/".to_string();
+        let config = OpenCodeConfig {
+            url: "http://127.0.0.1:4096/".to_string(),
+            ..Default::default()
+        };
         let client = V1Http::new(&config).unwrap();
         assert_eq!(client.base_url, "http://127.0.0.1:4096");
     }

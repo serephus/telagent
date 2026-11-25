@@ -59,6 +59,8 @@ pub struct OutboxItem {
     pub session_id: String,
     pub text: String,
     pub attempts: i64,
+    #[serde(default)]
+    pub next_attempt_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,6 +431,37 @@ impl Db {
         .await
     }
 
+    pub async fn clear_active_session(&self, chat_id: i64) -> Result<()> {
+        let key = active_session_key(chat_id);
+        self.run(move |db| {
+            let write = db.begin_write()?;
+            {
+                let mut table = write.open_table(KV)?;
+                table.remove(key.as_str())?;
+            }
+            write.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn pending_request_count(&self, chat_id: i64) -> Result<usize> {
+        self.run(move |db| {
+            let read = db.begin_read()?;
+            let table = read.open_table(PENDING)?;
+            let mut count = 0;
+            for entry in table.iter()? {
+                let (_, value) = entry?;
+                let record: PendingRequest = decode(value.value())?;
+                if record.chat_id == Some(chat_id) {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        })
+        .await
+    }
+
     pub async fn store_telegram_message(
         &self,
         chat_id: i64,
@@ -630,6 +663,7 @@ impl Db {
                     session_id,
                     text,
                     attempts: 0,
+                    next_attempt_at: 0,
                 };
                 let bytes = encode(&item)?;
                 table.insert(id, bytes.as_slice())?;
@@ -680,6 +714,8 @@ impl Db {
                     .transpose()?;
                 if let Some(mut item) = item {
                     item.attempts += 1;
+                    let delay = (5 * 2_i64.pow(item.attempts.min(6) as u32)).min(300);
+                    item.next_attempt_at = now() + delay;
                     let bytes = encode(&item)?;
                     table.insert(id, bytes.as_slice())?;
                 }
@@ -841,6 +877,7 @@ mod tests {
         db.increment_outbox_attempts(items[0].id).await.unwrap();
         let items = db.list_outbox(10).await.unwrap();
         assert_eq!(items[0].attempts, 1);
+        assert!(items[0].next_attempt_at > now());
         db.remove_outbox(items[0].id).await.unwrap();
         assert_eq!(db.list_outbox(10).await.unwrap().len(), 1);
     }

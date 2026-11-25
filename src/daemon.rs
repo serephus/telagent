@@ -61,6 +61,9 @@ pub async fn outbox_loop(state: AppState) {
         };
 
         for item in items {
+            if item.next_attempt_at > crate::state::now() {
+                continue;
+            }
             let directory = match state.session_directory(&item.session_id).await {
                 Ok(directory) => directory,
                 Err(error) => {

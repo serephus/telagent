@@ -123,17 +123,23 @@ pub fn question_message(session: &SessionRecord, request: &QuestionRequest) -> S
     message
 }
 
-pub fn sessions_message(sessions: &[SessionRecord]) -> String {
+pub fn sessions_message(sessions: &[SessionRecord], active_session: Option<&str>) -> String {
     if sessions.is_empty() {
         return "No sessions found.".to_string();
     }
     let mut message = String::from("Recent sessions:");
     for session in sessions {
+        let marker = if active_session == Some(session.session_id.as_str()) {
+            " *"
+        } else {
+            ""
+        };
         message.push_str(&format!(
-            "\n- {}  [{}]  {}",
+            "\n- {}  [{}]  {}{}",
             session_title(session),
             session.state,
-            session.session_id
+            session.session_id,
+            marker
         ));
     }
     message

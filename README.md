@@ -158,6 +158,7 @@ and interact with the bot. An empty list relies on the pairing code alone.
 /compact [ID]
 /sessions
 /use ID
+/cancel
 /status
 /mute [ID]
 /unmute [ID]
@@ -169,7 +170,8 @@ Reply to any notification to send feedback to that session. If no reply target
 is set, the active session from `/use` is used.
 
 Commands such as `/compact`, `/mute`, and `/abort` also use the replied
-notification's session when sent as a reply.
+notification's session when sent as a reply. `/cancel` clears the active
+session selection; `/status` shows it with a `*` and reports pending requests.
 
 `/new` creates a session and makes it active. Missing directories are created.
 Without a directory it uses the active session's directory, then
@@ -267,11 +269,10 @@ url = "http://127.0.0.1:4096"
 # password_file = "/run/secrets/opencode-server-password"
 ```
 
-The V2 adapter uses `/api/event`, `/api/session/active`,
+The V2 adapter uses `/api/event`, `/api/session`, `/api/session/active`,
 `/api/session/{id}/message`, `/api/session/{id}/prompt`,
-`/api/session/{id}/interrupt`, permission replies, and form replies. V2 forms
-are mapped onto the Telegram question flow; typed fields such as booleans,
-numbers, and multiselects are converted back into `Form.Answer` values.
+`/api/session/{id}/interrupt`, `/api/session/{id}/compact`, permission replies,
+and question replies. Questions are mapped onto the Telegram question flow.
 
 Automatic V2 service discovery is available:
 

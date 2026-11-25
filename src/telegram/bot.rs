@@ -18,6 +18,12 @@ use crate::{
 
 pub type HandlerResult = ResponseResult<()>;
 
+struct ParsedCommand<'a> {
+    command: &'a str,
+    args: Vec<&'a str>,
+    raw_args: &'a str,
+}
+
 pub async fn handle_update(bot: Bot, update: Update, state: Arc<AppState>) -> HandlerResult {
     let update_id = update.id.0 as i64;
     if state
@@ -68,7 +74,7 @@ async fn handle_message(bot: &Bot, state: &AppState, message: &Message) -> Resul
     let bound = state.db.is_bound(chat_id.0).await?;
 
     if let Some(text) = message.text()
-        && let Some((command, args)) = parse_command(text)
+        && let Some(parsed) = parse_command(text)
     {
         let reply_session_id = match message.reply_to_message() {
             Some(reply) => {
@@ -83,8 +89,7 @@ async fn handle_message(bot: &Bot, state: &AppState, message: &Message) -> Resul
             bot,
             state,
             message,
-            command,
-            &args,
+            &parsed,
             bound,
             reply_session_id.as_deref(),
         )
@@ -148,13 +153,14 @@ async fn handle_command(
     bot: &Bot,
     state: &AppState,
     message: &Message,
-    command: &str,
-    args: &[&str],
+    parsed: &ParsedCommand<'_>,
     bound: bool,
     reply_session_id: Option<&str>,
 ) -> Result<()> {
     let chat_id = message.chat.id;
     let user_id = message.from.as_ref().map(|user| user.id.0).unwrap_or(0);
+    let command = parsed.command;
+    let args = &parsed.args;
 
     match command {
         "start" | "help" => {
@@ -199,8 +205,8 @@ async fn handle_command(
             send(bot, chat_id, "Unbound this chat.").await?;
         }
         "new" => {
-            let requested = args.join(" ");
-            let requested = requested.trim();
+            let (requested_directory, prompt) = parse_new_args(parsed.raw_args);
+            let requested = requested_directory.as_deref().unwrap_or("");
             let active_directory = match state.db.active_session(chat_id.0).await? {
                 Some(session_id) => state.session_directory(&session_id).await?,
                 None => String::new(),
@@ -268,24 +274,39 @@ async fn handle_command(
             match state.backend.create_session(&directory).await {
                 Ok(info) => {
                     let session = state.sync_session(&info, "idle").await?;
+                    let session_directory = state.session_directory(&session.session_id).await?;
                     state
                         .db
                         .set_active_session(chat_id.0, &session.session_id)
                         .await?;
-                    send(
-                        bot,
-                        chat_id,
-                        format!(
-                            "Started session {}\n{}",
-                            session.session_id,
-                            if session.title.is_empty() {
-                                session.directory.clone()
-                            } else {
-                                session.title.clone()
+                    let mut text = format!(
+                        "Started session {}\n{}",
+                        session.session_id,
+                        if session.title.is_empty() {
+                            session.directory.clone()
+                        } else {
+                            session.title.clone()
+                        }
+                    );
+                    if let Some(prompt) = prompt {
+                        match state
+                            .backend
+                            .prompt_async(&session.session_id, &session_directory, &prompt)
+                            .await
+                        {
+                            Ok(()) => {
+                                text.push_str("\nPrompt sent.");
                             }
-                        ),
-                    )
-                    .await?;
+                            Err(error) => {
+                                state
+                                    .db
+                                    .enqueue_outbox(&session.session_id, &prompt)
+                                    .await?;
+                                text.push_str(&format!("\nPrompt queued: {error}"));
+                            }
+                        }
+                    }
+                    send(bot, chat_id, text).await?;
                 }
                 Err(error) => {
                     tracing::warn!(directory = %directory, %error, "failed to create session");
@@ -766,11 +787,53 @@ fn callback_chat_id(callback: &CallbackQuery) -> i64 {
     }
 }
 
-fn parse_command(text: &str) -> Option<(&str, Vec<&str>)> {
+fn parse_command(text: &str) -> Option<ParsedCommand<'_>> {
     let rest = text.trim().strip_prefix('/')?;
-    let mut parts = rest.split_whitespace();
-    let command = parts.next()?.split('@').next().unwrap_or("");
-    Some((command, parts.collect()))
+    let (head, raw_args) = rest
+        .split_once(|ch: char| ch.is_whitespace())
+        .unwrap_or((rest, ""));
+    let command = head.split('@').next().unwrap_or("");
+    let raw_args = raw_args.trim();
+    Some(ParsedCommand {
+        command,
+        args: raw_args.split_whitespace().collect(),
+        raw_args,
+    })
+}
+
+fn parse_new_args(input: &str) -> (Option<String>, Option<String>) {
+    let input = input.trim();
+    if input.is_empty() {
+        return (None, None);
+    }
+    if let Some(prompt) = input.strip_prefix("--") {
+        let prompt = prompt.trim();
+        return (None, (!prompt.is_empty()).then(|| prompt.to_string()));
+    }
+    let (directory, rest) = parse_first_argument(input);
+    let rest = rest.trim();
+    let rest = rest.strip_prefix("--").map(str::trim).unwrap_or(rest);
+    let prompt = (!rest.is_empty()).then(|| rest.to_string());
+    (Some(directory), prompt)
+}
+
+fn parse_first_argument(input: &str) -> (String, &str) {
+    if let Some(rest) = input.strip_prefix('"') {
+        return match rest.split_once('"') {
+            Some((directory, rest)) => (directory.to_string(), rest),
+            None => (rest.to_string(), ""),
+        };
+    }
+    if let Some(rest) = input.strip_prefix('\'') {
+        return match rest.split_once('\'') {
+            Some((directory, rest)) => (directory.to_string(), rest),
+            None => (rest.to_string(), ""),
+        };
+    }
+    match input.split_once(|ch: char| ch.is_whitespace()) {
+        Some((directory, rest)) => (directory.to_string(), rest),
+        None => (input.to_string(), ""),
+    }
 }
 
 #[cfg(test)]
@@ -790,6 +853,55 @@ mod tests {
         assert_eq!(
             resolve_directory("/tmp/project", "/tmp/base"),
             PathBuf::from("/tmp/project")
+        );
+    }
+
+    #[test]
+    fn parses_new_directory_only() {
+        assert_eq!(
+            parse_new_args("/tmp/project"),
+            (Some("/tmp/project".to_string()), None)
+        );
+    }
+
+    #[test]
+    fn parses_new_directory_and_prompt() {
+        assert_eq!(
+            parse_new_args("/tmp/project fix the build"),
+            (
+                Some("/tmp/project".to_string()),
+                Some("fix the build".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn parses_quoted_new_directory() {
+        assert_eq!(
+            parse_new_args("\"/tmp/my project\" fix the build"),
+            (
+                Some("/tmp/my project".to_string()),
+                Some("fix the build".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn parses_new_prompt_without_directory() {
+        assert_eq!(
+            parse_new_args("-- fix the build"),
+            (None, Some("fix the build".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_new_directory_separator() {
+        assert_eq!(
+            parse_new_args("/tmp/project -- fix the build"),
+            (
+                Some("/tmp/project".to_string()),
+                Some("fix the build".to_string())
+            )
         );
     }
 }

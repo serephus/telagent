@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use teloxide::{Bot, dispatching::Dispatcher};
+use teloxide::{Bot, dispatching::Dispatcher, prelude::Requester, types::BotCommand};
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod app;
@@ -83,6 +83,9 @@ async fn run_daemon(config: Config) -> Result<()> {
     tracing::info!(backend = backend.name(), "opencode backend ready");
     let token = config.bot_token()?;
     let bot = build_bot(token, config.telegram.proxy.as_deref())?;
+    if let Err(error) = register_commands(&bot).await {
+        tracing::warn!(%error, "failed to register Telegram commands");
+    }
     let paste = PasteClient::new(&config.notify.paste)?;
     let notifier = Notifier::new(
         bot.clone(),
@@ -157,6 +160,22 @@ async fn run_status(config: Config) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+async fn register_commands(bot: &Bot) -> Result<()> {
+    let commands = vec![
+        BotCommand::new("bind", "Bind this chat with a pairing code"),
+        BotCommand::new("unbind", "Unbind this chat"),
+        BotCommand::new("sessions", "List recent sessions"),
+        BotCommand::new("use", "Select the active session"),
+        BotCommand::new("status", "Show bound sessions and state"),
+        BotCommand::new("mute", "Mute completion notifications"),
+        BotCommand::new("unmute", "Unmute completion notifications"),
+        BotCommand::new("abort", "Abort a running session"),
+        BotCommand::new("help", "Show available commands"),
+    ];
+    bot.set_my_commands(commands).await?;
     Ok(())
 }
 

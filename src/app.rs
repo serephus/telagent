@@ -57,6 +57,25 @@ impl AppState {
         Ok(session.directory)
     }
 
+    pub async fn forget_pending_request(&self, request_id: &str) -> Result<()> {
+        match self.db.list_pending_requests().await {
+            Ok(requests) => {
+                for request in requests
+                    .into_iter()
+                    .filter(|request| request.request_id == request_id)
+                {
+                    self.notifier
+                        .delete_telegram_message(request.chat_id, request.message_id)
+                        .await;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, request_id, "failed to list pending requests");
+            }
+        }
+        self.db.remove_pending_request(request_id).await
+    }
+
     pub async fn sync_session(&self, info: &SessionInfo, state: &str) -> Result<SessionRecord> {
         let existing = self.db.get_session(&self.instance_id, &info.id).await?;
 

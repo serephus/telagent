@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -45,6 +48,76 @@ pub async fn event_loop(state: AppState) {
         tracing::info!(backoff, "reconnecting to opencode event stream");
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
+    }
+}
+
+pub async fn reconcile_loop(state: AppState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        interval.tick().await;
+        reconcile_pending_requests(&state).await;
+    }
+}
+
+async fn reconcile_pending_requests(state: &AppState) {
+    let requests = match state.db.list_pending_requests().await {
+        Ok(requests) => requests,
+        Err(error) => {
+            tracing::warn!(%error, "failed to read pending requests");
+            return;
+        }
+    };
+
+    let mut checked: HashMap<(String, String), Option<HashSet<String>>> = HashMap::new();
+    let mut stale: HashSet<String> = HashSet::new();
+    for request in requests {
+        if request.kind != "permission" && request.kind != "question" {
+            continue;
+        }
+
+        let cache_key = (request.kind.clone(), request.session_id.clone());
+        let ids = if let Some(ids) = checked.get(&cache_key) {
+            ids.clone()
+        } else {
+            let directory = match state.session_directory(&request.session_id).await {
+                Ok(directory) => directory,
+                Err(error) => {
+                    tracing::warn!(%error, session_id = %request.session_id, "failed to read session directory");
+                    continue;
+                }
+            };
+            let ids = match request.kind.as_str() {
+                "permission" => {
+                    state
+                        .backend
+                        .pending_permission_ids(&request.session_id, &directory)
+                        .await
+                }
+                _ => {
+                    state
+                        .backend
+                        .pending_question_ids(&request.session_id, &directory)
+                        .await
+                }
+            };
+            let ids = match ids {
+                Ok(ids) => ids,
+                Err(error) => {
+                    tracing::warn!(%error, session_id = %request.session_id, kind = %request.kind, "failed to list pending requests");
+                    continue;
+                }
+            };
+            checked.insert(cache_key, ids.clone());
+            ids
+        };
+
+        if let Some(ids) = ids
+            && !ids.contains(&request.request_id)
+            && stale.insert(request.request_id.clone())
+            && let Err(error) = state.forget_pending_request(&request.request_id).await
+        {
+            tracing::warn!(%error, request_id = %request.request_id, kind = %request.kind, "failed to remove stale request");
+        }
     }
 }
 
@@ -207,7 +280,9 @@ async fn handle_event(state: &AppState, event: AgentEvent) -> Result<()> {
             reply,
         } => {
             tracing::debug!(session_id, request_id, reply, "permission replied");
-            let _ = state.db.remove_pending_request(&request_id).await;
+            if let Err(error) = state.forget_pending_request(&request_id).await {
+                tracing::warn!(%error, request_id, "failed to remove replied permission request");
+            }
         }
         AgentEvent::QuestionReplied {
             session_id,

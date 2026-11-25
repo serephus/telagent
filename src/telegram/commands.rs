@@ -30,8 +30,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "new",
-        usage: "[DIRECTORY]",
-        description: "Start a new session",
+        usage: "[DIRECTORY] [PROMPT]",
+        description: "Start a new session with an optional prompt",
     },
     CommandSpec {
         name: "compact",

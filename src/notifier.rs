@@ -3,7 +3,7 @@ use teloxide::{
     Bot,
     payloads::SendMessageSetters,
     prelude::Requester,
-    types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup},
+    types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, MessageId},
 };
 
 use crate::{
@@ -74,6 +74,7 @@ impl Notifier {
             .deliver(&session.session_id, "permission", &text, Some(markup))
             .await?;
 
+        let payload = serde_json::to_string(request)?;
         for (chat_id, message_id) in &sent {
             self.db
                 .add_pending_request(
@@ -82,7 +83,7 @@ impl Notifier {
                     &session.session_id,
                     Some(*chat_id),
                     Some(*message_id),
-                    None,
+                    Some(&payload),
                 )
                 .await?;
         }
@@ -114,6 +115,19 @@ impl Notifier {
                 .await?;
         }
         Ok(sent)
+    }
+
+    pub async fn delete_telegram_message(&self, chat_id: Option<i64>, message_id: Option<i32>) {
+        let (Some(chat_id), Some(message_id)) = (chat_id, message_id) else {
+            return;
+        };
+        if let Err(error) = self
+            .bot
+            .delete_message(ChatId(chat_id), MessageId(message_id))
+            .await
+        {
+            tracing::warn!(chat_id, message_id, %error, "failed to delete telegram message");
+        }
     }
 
     pub async fn notify_created(&self, session: &SessionRecord) -> Result<Vec<(i64, i32)>> {
@@ -158,7 +172,16 @@ impl Notifier {
 
         for chat_id in chats {
             for (index, chunk) in chunks.iter().enumerate() {
-                let mut request = self.bot.send_message(ChatId(chat_id), chunk.clone());
+                let mut request = self
+                    .bot
+                    .send_message(ChatId(chat_id), chunk.clone())
+                    .link_preview_options(LinkPreviewOptions {
+                        is_disabled: true,
+                        url: None,
+                        prefer_small_media: false,
+                        prefer_large_media: false,
+                        show_above_text: false,
+                    });
                 if index == last_index
                     && let Some(markup) = &markup
                 {

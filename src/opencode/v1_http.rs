@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -13,7 +13,8 @@ use crate::{
     opencode::{
         backend::{EventStream, OpenCodeBackend},
         types::{
-            MessageWithParts, PermissionReply, RawEvent, SessionContext, SessionInfo, SessionStatus,
+            MessageWithParts, PermissionReply, PermissionRequest, QuestionRequest, RawEvent,
+            SessionContext, SessionInfo, SessionStatus,
         },
     },
 };
@@ -284,6 +285,31 @@ impl OpenCodeBackend for V1Http {
             },
         )
         .await
+    }
+
+    async fn pending_permission_ids(
+        &self,
+        _session_id: &str,
+        directory: &str,
+    ) -> Result<Option<HashSet<String>>> {
+        let permissions: Vec<PermissionRequest> = self.get_json("/permission", directory).await?;
+        Ok(Some(
+            permissions
+                .into_iter()
+                .map(|permission| permission.id)
+                .collect(),
+        ))
+    }
+
+    async fn pending_question_ids(
+        &self,
+        _session_id: &str,
+        directory: &str,
+    ) -> Result<Option<HashSet<String>>> {
+        let questions: Vec<QuestionRequest> = self.get_json("/question", directory).await?;
+        Ok(Some(
+            questions.into_iter().map(|question| question.id).collect(),
+        ))
     }
 
     async fn reply_question(
@@ -649,6 +675,54 @@ mod tests {
         assert_eq!(context.model.as_deref(), Some("gpt-5"));
         assert_eq!(context.used_tokens, Some(750_000));
         assert_eq!(context.context_limit, Some(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn lists_pending_permission_ids() {
+        let router = Router::new()
+            .route(
+                "/permission",
+                get(|| async {
+                    Json(json!([{
+                        "id": "per_1",
+                        "sessionID": "ses_1",
+                        "permission": "read",
+                        "patterns": ["/tmp/.env"],
+                        "metadata": {},
+                        "always": []
+                    }]))
+                }),
+            )
+            .route(
+                "/question",
+                get(|| async {
+                    Json(json!([{
+                        "id": "que_1",
+                        "sessionID": "ses_1",
+                        "questions": []
+                    }]))
+                }),
+            );
+        let url = spawn(router).await;
+        let config = OpenCodeConfig {
+            url,
+            ..Default::default()
+        };
+        let client = V1Http::new(&config).unwrap();
+
+        let ids = client
+            .pending_permission_ids("ses_1", "/tmp")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ids.contains("per_1"));
+
+        let ids = client
+            .pending_question_ids("ses_1", "/tmp")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ids.contains("que_1"));
     }
 
     #[tokio::test]

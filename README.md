@@ -154,7 +154,7 @@ and interact with the bot. An empty list relies on the pairing code alone.
 ```text
 /bind CODE
 /unbind
-/new [DIRECTORY]
+/new [DIRECTORY] [PROMPT]
 /compact [ID]
 /sessions
 /use ID
@@ -177,6 +177,13 @@ session selection; `/status` shows it with a `*` and reports pending requests.
 Without a directory it uses the active session's directory, then
 `opencode.directory`, then the server default. Relative paths resolve against
 the active or configured directory, and `~/` expands to your home directory.
+The first argument is the directory; the rest is sent as the first prompt.
+Quote paths that contain spaces:
+
+```text
+/new "/home/me/my project" fix the build
+/new -- summarize the open issues
+```
 
 `/compact` compacts the active session with its current model.
 
@@ -200,6 +207,12 @@ reports it.
 `question.asked` becomes a Telegram message with option buttons when there is a
 single question. For custom or multi-question requests, reply to the message
 with text. For multiple questions, send one answer per line.
+
+Permission confirmations include the permission name and patterns. Pending
+permission and question requests are reconciled with opencode, so expired or
+already answered requests are removed and their original Telegram messages are
+deleted. Permission confirmation replies stay in history. Link previews are
+disabled in bot messages.
 
 ## Configuration
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -392,6 +392,58 @@ impl OpenCodeBackend for V2Http {
             },
         )
         .await
+    }
+
+    async fn pending_permission_ids(
+        &self,
+        session_id: &str,
+        _directory: &str,
+    ) -> Result<Option<HashSet<String>>> {
+        let response: Value = self
+            .get_json(&format!("/api/session/{session_id}/permission"))
+            .await?;
+        let ids = response
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|permissions| {
+                permissions
+                    .iter()
+                    .filter_map(|permission| {
+                        permission
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(ids))
+    }
+
+    async fn pending_question_ids(
+        &self,
+        session_id: &str,
+        _directory: &str,
+    ) -> Result<Option<HashSet<String>>> {
+        let response: Value = self
+            .get_json(&format!("/api/session/{session_id}/question"))
+            .await?;
+        let ids = response
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|questions| {
+                questions
+                    .iter()
+                    .filter_map(|question| {
+                        question
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(ids))
     }
 
     async fn reply_question(

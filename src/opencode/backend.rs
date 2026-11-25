@@ -21,16 +21,23 @@ pub trait OpenCodeBackend: Send + Sync {
     async fn messages(
         &self,
         session_id: &str,
+        directory: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<MessageWithParts>>;
 
-    async fn prompt_async(&self, session_id: &str, text: &str) -> anyhow::Result<()>;
+    async fn prompt_async(
+        &self,
+        session_id: &str,
+        directory: &str,
+        text: &str,
+    ) -> anyhow::Result<()>;
 
-    async fn abort(&self, session_id: &str) -> anyhow::Result<()>;
+    async fn abort(&self, session_id: &str, directory: &str) -> anyhow::Result<()>;
 
     async fn reply_permission(
         &self,
         session_id: &str,
+        directory: &str,
         request_id: &str,
         reply: PermissionReply,
     ) -> anyhow::Result<()>;
@@ -38,6 +45,7 @@ pub trait OpenCodeBackend: Send + Sync {
     async fn reply_question(
         &self,
         session_id: &str,
+        directory: &str,
         request_id: &str,
         request: &QuestionRequest,
         answers: Vec<Vec<String>>,

@@ -248,7 +248,12 @@ impl OpenCodeBackend for V2Http {
             .collect())
     }
 
-    async fn messages(&self, session_id: &str, limit: usize) -> Result<Vec<MessageWithParts>> {
+    async fn messages(
+        &self,
+        session_id: &str,
+        _directory: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageWithParts>> {
         let response: MessagesResponse = self
             .get_json(&format!(
                 "/api/session/{session_id}/message?limit={limit}&order=desc"
@@ -257,7 +262,7 @@ impl OpenCodeBackend for V2Http {
         Ok(response.data.iter().filter_map(normalize_message).collect())
     }
 
-    async fn prompt_async(&self, session_id: &str, text: &str) -> Result<()> {
+    async fn prompt_async(&self, session_id: &str, _directory: &str, text: &str) -> Result<()> {
         #[derive(serde::Serialize)]
         struct Body<'a> {
             text: &'a str,
@@ -266,7 +271,7 @@ impl OpenCodeBackend for V2Http {
             .await
     }
 
-    async fn abort(&self, session_id: &str) -> Result<()> {
+    async fn abort(&self, session_id: &str, _directory: &str) -> Result<()> {
         self.post_empty(&format!("/api/session/{session_id}/interrupt"))
             .await
     }
@@ -274,6 +279,7 @@ impl OpenCodeBackend for V2Http {
     async fn reply_permission(
         &self,
         session_id: &str,
+        _directory: &str,
         request_id: &str,
         reply: PermissionReply,
     ) -> Result<()> {
@@ -293,6 +299,7 @@ impl OpenCodeBackend for V2Http {
     async fn reply_question(
         &self,
         session_id: &str,
+        _directory: &str,
         request_id: &str,
         request: &QuestionRequest,
         answers: Vec<Vec<String>>,
@@ -1047,19 +1054,19 @@ mod integration_tests {
         let statuses = client.session_statuses().await.unwrap();
         assert_eq!(statuses.get("ses_1"), Some(&SessionStatus::Busy));
 
-        let messages = client.messages("ses_1", 10).await.unwrap();
+        let messages = client.messages("ses_1", "", 10).await.unwrap();
         assert_eq!(messages[0].text(), "done");
 
-        client.prompt_async("ses_1", "hello").await.unwrap();
+        client.prompt_async("ses_1", "", "hello").await.unwrap();
         assert_eq!(
             prompt_captured.lock().unwrap().as_ref().unwrap()["text"],
             "hello"
         );
 
-        client.abort("ses_1").await.unwrap();
+        client.abort("ses_1", "").await.unwrap();
 
         client
-            .reply_permission("ses_1", "per_1", PermissionReply::Once)
+            .reply_permission("ses_1", "", "per_1", PermissionReply::Once)
             .await
             .unwrap();
         assert_eq!(
@@ -1085,7 +1092,13 @@ mod integration_tests {
             }],
         };
         client
-            .reply_question("ses_1", "form_1", &request, vec![vec!["Fast".to_string()]])
+            .reply_question(
+                "ses_1",
+                "",
+                "form_1",
+                &request,
+                vec![vec!["Fast".to_string()]],
+            )
             .await
             .unwrap();
         assert_eq!(

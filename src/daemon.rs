@@ -61,9 +61,16 @@ pub async fn outbox_loop(state: AppState) {
         };
 
         for item in items {
+            let directory = match state.session_directory(&item.session_id).await {
+                Ok(directory) => directory,
+                Err(error) => {
+                    tracing::warn!(%error, session_id = %item.session_id, "failed to read session directory");
+                    continue;
+                }
+            };
             match state
                 .backend
-                .prompt_async(&item.session_id, &item.text)
+                .prompt_async(&item.session_id, &directory, &item.text)
                 .await
             {
                 Ok(()) => {
@@ -244,7 +251,10 @@ async fn notify_completion(state: &AppState, session_id: &str) -> Result<()> {
     state.db.update_state(session_id, "idle").await?;
     session.state = "idle".to_string();
 
-    let messages = state.backend.messages(session_id, 10).await?;
+    let messages = state
+        .backend
+        .messages(session_id, &session.directory, 10)
+        .await?;
     let Some((message_id, text)) = render::extract_last_assistant_text(&messages) else {
         return Ok(());
     };

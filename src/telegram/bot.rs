@@ -225,7 +225,11 @@ async fn handle_command(
                 send(bot, chat_id, "No active session. Pass a session ID.").await?;
                 return Ok(());
             };
-            match state.backend.abort(&session_id).await {
+            match state
+                .backend
+                .abort(&session_id, &state.session_directory(&session_id).await?)
+                .await
+            {
                 Ok(()) => {
                     send(bot, chat_id, format!("Aborted {session_id}.")).await?;
                 }
@@ -315,7 +319,12 @@ async fn handle_callback(bot: &Bot, state: &AppState, callback: &CallbackQuery) 
             }
             match state
                 .backend
-                .reply_permission(&pending.session_id, request_id, reply)
+                .reply_permission(
+                    &pending.session_id,
+                    &state.session_directory(&pending.session_id).await?,
+                    request_id,
+                    reply,
+                )
                 .await
             {
                 Ok(()) => {
@@ -377,7 +386,13 @@ async fn handle_callback(bot: &Bot, state: &AppState, callback: &CallbackQuery) 
                 vec![option.value.clone().unwrap_or_else(|| option.label.clone())];
             match state
                 .backend
-                .reply_question(&pending.session_id, request_id, &request, answers)
+                .reply_question(
+                    &pending.session_id,
+                    &state.session_directory(&pending.session_id).await?,
+                    request_id,
+                    &request,
+                    answers,
+                )
                 .await
             {
                 Ok(()) => {
@@ -417,7 +432,12 @@ async fn send_feedback(
     session_id: &str,
     text: &str,
 ) -> Result<()> {
-    match state.backend.prompt_async(session_id, text).await {
+    let directory = state.session_directory(session_id).await?;
+    match state
+        .backend
+        .prompt_async(session_id, &directory, text)
+        .await
+    {
         Ok(()) => {
             send(bot, chat_id, format!("Sent to {session_id}.")).await?;
         }
@@ -490,7 +510,13 @@ async fn answer_pending_question(
 
     match state
         .backend
-        .reply_question(&pending.session_id, &pending.request_id, &request, answers)
+        .reply_question(
+            &pending.session_id,
+            &state.session_directory(&pending.session_id).await?,
+            &pending.request_id,
+            &request,
+            answers,
+        )
         .await
     {
         Ok(()) => {

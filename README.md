@@ -171,8 +171,10 @@ is set, the active session from `/use` is used.
 Commands such as `/compact`, `/mute`, and `/abort` also use the replied
 notification's session when sent as a reply.
 
-`/new` creates a session and makes it active. Without a directory it uses the
-active session's directory, then `opencode.directory`, then the server default.
+`/new` creates a session and makes it active. Missing directories are created.
+Without a directory it uses the active session's directory, then
+`opencode.directory`, then the server default. Relative paths resolve against
+the active or configured directory, and `~/` expands to your home directory.
 
 `/compact` compacts the active session with its current model.
 

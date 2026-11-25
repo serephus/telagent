@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use teloxide::{
@@ -200,20 +200,53 @@ async fn handle_command(
         }
         "new" => {
             let requested = args.join(" ");
-            let directory = if requested.trim().is_empty() {
-                match state.db.active_session(chat_id.0).await? {
-                    Some(session_id) => state.session_directory(&session_id).await?,
-                    None => state
-                        .config
-                        .opencode
-                        .directory
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
+            let requested = requested.trim();
+            let active_directory = match state.db.active_session(chat_id.0).await? {
+                Some(session_id) => state.session_directory(&session_id).await?,
+                None => String::new(),
+            };
+            let configured_directory = state
+                .config
+                .opencode
+                .directory
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let directory = if requested.is_empty() {
+                if !active_directory.is_empty() {
+                    PathBuf::from(active_directory)
+                } else if !configured_directory.is_empty() {
+                    PathBuf::from(configured_directory)
+                } else {
+                    PathBuf::new()
                 }
             } else {
-                requested.trim().to_string()
+                let base = if !active_directory.is_empty() {
+                    active_directory
+                } else if !configured_directory.is_empty() {
+                    configured_directory
+                } else {
+                    std::env::current_dir()?.to_string_lossy().into_owned()
+                };
+                resolve_directory(requested, &base)
             };
+            let directory = if directory.as_os_str().is_empty() || directory.is_absolute() {
+                directory
+            } else {
+                std::env::current_dir()?.join(directory)
+            };
+            let directory = directory.to_string_lossy().into_owned();
+            if !directory.is_empty()
+                && let Err(error) = std::fs::create_dir_all(&directory)
+            {
+                send(
+                    bot,
+                    chat_id,
+                    format!("Failed to create directory {directory}: {error}"),
+                )
+                .await?;
+                return Ok(());
+            }
             match state.backend.create_session(&directory).await {
                 Ok(info) => {
                     let session = state.sync_session(&info, "idle").await?;
@@ -656,6 +689,23 @@ async fn resolve_session_id(
     state.db.active_session(chat_id).await
 }
 
+fn resolve_directory(requested: &str, base: &str) -> PathBuf {
+    let expanded = if requested == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(requested))
+    } else if let Some(rest) = requested.strip_prefix("~/") {
+        dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(requested))
+    } else {
+        PathBuf::from(requested)
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        PathBuf::from(base).join(expanded)
+    }
+}
+
 async fn send(bot: &Bot, chat_id: ChatId, text: impl Into<String>) -> Result<()> {
     bot.send_message(chat_id, text.into()).await?;
     Ok(())
@@ -673,4 +723,25 @@ fn parse_command(text: &str) -> Option<(&str, Vec<&str>)> {
     let mut parts = rest.split_whitespace();
     let command = parts.next()?.split('@').next().unwrap_or("");
     Some((command, parts.collect()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_relative_directory_under_base() {
+        assert_eq!(
+            resolve_directory("project", "/tmp/base"),
+            PathBuf::from("/tmp/base/project")
+        );
+    }
+
+    #[test]
+    fn resolves_absolute_directory_as_is() {
+        assert_eq!(
+            resolve_directory("/tmp/project", "/tmp/base"),
+            PathBuf::from("/tmp/project")
+        );
+    }
 }

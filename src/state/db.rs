@@ -59,6 +59,8 @@ pub struct OutboxItem {
     pub session_id: String,
     pub text: String,
     pub attempts: i64,
+    #[serde(default)]
+    pub next_attempt_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -661,6 +663,7 @@ impl Db {
                     session_id,
                     text,
                     attempts: 0,
+                    next_attempt_at: 0,
                 };
                 let bytes = encode(&item)?;
                 table.insert(id, bytes.as_slice())?;
@@ -711,6 +714,8 @@ impl Db {
                     .transpose()?;
                 if let Some(mut item) = item {
                     item.attempts += 1;
+                    let delay = (5 * 2_i64.pow(item.attempts.min(6) as u32)).min(300);
+                    item.next_attempt_at = now() + delay;
                     let bytes = encode(&item)?;
                     table.insert(id, bytes.as_slice())?;
                 }
@@ -872,6 +877,7 @@ mod tests {
         db.increment_outbox_attempts(items[0].id).await.unwrap();
         let items = db.list_outbox(10).await.unwrap();
         assert_eq!(items[0].attempts, 1);
+        assert!(items[0].next_attempt_at > now());
         db.remove_outbox(items[0].id).await.unwrap();
         assert_eq!(db.list_outbox(10).await.unwrap().len(), 1);
     }

@@ -29,6 +29,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Unbind this chat",
     },
     CommandSpec {
+        name: "new",
+        usage: "[DIRECTORY]",
+        description: "Start a new session",
+    },
+    CommandSpec {
         name: "sessions",
         usage: "",
         description: "List recent sessions",

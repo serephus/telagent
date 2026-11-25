@@ -75,6 +75,21 @@ impl V1Http {
         ensure_success(response).await
     }
 
+    async fn post_json_decode<T: DeserializeOwned, B: Serialize>(
+        &self,
+        path: &str,
+        directory: &str,
+        body: &B,
+    ) -> Result<T> {
+        let response = self
+            .request(reqwest::Method::POST, path)
+            .query(&directory_query(directory))
+            .json(body)
+            .send()
+            .await?;
+        decode(response).await
+    }
+
     async fn post_empty(&self, path: &str, directory: &str) -> Result<()> {
         let response = self
             .request(reqwest::Method::POST, path)
@@ -97,6 +112,13 @@ impl OpenCodeBackend for V1Http {
 
     async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
         self.get_json("/session", "").await
+    }
+
+    async fn create_session(&self, directory: &str) -> Result<SessionInfo> {
+        #[derive(Serialize)]
+        struct Body {}
+
+        self.post_json_decode("/session", directory, &Body {}).await
     }
 
     async fn session_statuses(&self) -> Result<HashMap<String, SessionStatus>> {
@@ -297,6 +319,14 @@ mod tests {
                         "directory": "/tmp",
                         "projectID": "prj_1"
                     }]))
+                })
+                .post(|| async {
+                    Json(json!({
+                        "id": "ses_2",
+                        "title": "New session",
+                        "directory": "/tmp/project",
+                        "projectID": "prj_1"
+                    }))
                 }),
             )
             .route(
@@ -405,6 +435,10 @@ mod tests {
         let sessions = client.list_sessions().await.unwrap();
         assert_eq!(sessions[0].id, "ses_1");
         assert_eq!(sessions[0].title, "Test session");
+
+        let created = client.create_session("/tmp/project").await.unwrap();
+        assert_eq!(created.id, "ses_2");
+        assert_eq!(created.directory, "/tmp/project");
 
         let statuses = client.session_statuses().await.unwrap();
         assert_eq!(statuses.get("ses_1"), Some(&SessionStatus::Busy));

@@ -179,6 +179,49 @@ async fn handle_command(
             state.db.unbind(chat_id.0).await?;
             send(bot, chat_id, "Unbound this chat.").await?;
         }
+        "new" => {
+            let requested = args.join(" ");
+            let directory = if requested.trim().is_empty() {
+                match state.db.active_session(chat_id.0).await? {
+                    Some(session_id) => state.session_directory(&session_id).await?,
+                    None => state
+                        .config
+                        .opencode
+                        .directory
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                }
+            } else {
+                requested.trim().to_string()
+            };
+            match state.backend.create_session(&directory).await {
+                Ok(info) => {
+                    let session = state.sync_session(&info, "idle").await?;
+                    state
+                        .db
+                        .set_active_session(chat_id.0, &session.session_id)
+                        .await?;
+                    send(
+                        bot,
+                        chat_id,
+                        format!(
+                            "Started session {}\n{}",
+                            session.session_id,
+                            if session.title.is_empty() {
+                                session.directory.clone()
+                            } else {
+                                session.title.clone()
+                            }
+                        ),
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    send(bot, chat_id, format!("Failed to start session: {error}")).await?;
+                }
+            }
+        }
         "sessions" => {
             send_sessions(bot, state, chat_id).await?;
         }

@@ -12,6 +12,8 @@ url = "http://127.0.0.1:4096"
 username = "opencode"
 # password_file = "/run/secrets/opencode-server-password"
 events_path = "/global/event"
+# Directory used by /new when no directory is given and no session is active.
+# directory = "/home/me/dev/project"
 # V2 only: read URL and auth from ~/.local/state/opencode/service.json.
 auto_discover = false
 # service_file = "/home/me/.local/state/opencode/service.json"

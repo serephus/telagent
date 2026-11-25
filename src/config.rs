@@ -37,6 +37,7 @@ pub struct OpenCodeConfig {
     pub events_path: String,
     pub auto_discover: bool,
     pub service_file: Option<PathBuf>,
+    pub directory: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -96,6 +97,7 @@ impl Default for OpenCodeConfig {
             events_path: "/global/event".to_string(),
             auto_discover: false,
             service_file: None,
+            directory: None,
         }
     }
 }

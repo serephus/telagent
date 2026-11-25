@@ -208,6 +208,19 @@ impl V2Http {
         ensure_success(response).await
     }
 
+    async fn post_json_decode<T: serde::de::DeserializeOwned, B: serde::Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let response = self
+            .request(reqwest::Method::POST, path)
+            .json(body)
+            .send()
+            .await?;
+        decode(response).await
+    }
+
     async fn post_empty(&self, path: &str) -> Result<()> {
         let response = self.request(reqwest::Method::POST, path).send().await?;
         ensure_success(response).await
@@ -237,6 +250,34 @@ impl OpenCodeBackend for V2Http {
                 parent_id: session.parent_id,
             })
             .collect())
+    }
+
+    async fn create_session(&self, directory: &str) -> Result<SessionInfo> {
+        let directory = if directory.is_empty() {
+            std::env::current_dir()
+                .context("failed to resolve current directory")?
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            directory.to_string()
+        };
+        let response: CreateSessionResponse = self
+            .post_json_decode(
+                "/api/session",
+                &json!({"location": {"directory": directory}}),
+            )
+            .await?;
+        let session = response.data;
+        Ok(SessionInfo {
+            id: session.id,
+            title: session.title.unwrap_or_default(),
+            directory: session
+                .location
+                .map(|location| location.directory)
+                .unwrap_or(directory),
+            project_id: session.project_id,
+            parent_id: session.parent_id,
+        })
     }
 
     async fn session_statuses(&self) -> Result<HashMap<String, SessionStatus>> {
@@ -367,6 +408,11 @@ impl OpenCodeBackend for V2Http {
 #[derive(Debug, Deserialize)]
 struct SessionsResponse {
     data: Vec<V2Session>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSessionResponse {
+    data: V2Session,
 }
 
 #[derive(Debug, Deserialize)]
@@ -992,6 +1038,16 @@ mod integration_tests {
                         }],
                         "cursor": {"previous": null, "next": null}
                     }))
+                })
+                .post(|| async {
+                    Json(json!({
+                        "data": {
+                            "id": "ses_2",
+                            "title": "New session",
+                            "projectID": "prj_1",
+                            "location": {"directory": "/tmp/project"}
+                        }
+                    }))
                 }),
             )
             .route(
@@ -1050,6 +1106,10 @@ mod integration_tests {
         assert_eq!(sessions[0].id, "ses_1");
         assert_eq!(sessions[0].title, "Test session");
         assert_eq!(sessions[0].directory, "/tmp");
+
+        let created = client.create_session("/tmp/project").await.unwrap();
+        assert_eq!(created.id, "ses_2");
+        assert_eq!(created.directory, "/tmp/project");
 
         let statuses = client.session_statuses().await.unwrap();
         assert_eq!(statuses.get("ses_1"), Some(&SessionStatus::Busy));

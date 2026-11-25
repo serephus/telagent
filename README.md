@@ -154,6 +154,7 @@ and interact with the bot. An empty list relies on the pairing code alone.
 ```text
 /bind CODE
 /unbind
+/new [DIRECTORY]
 /sessions
 /use ID
 /status
@@ -165,6 +166,9 @@ and interact with the bot. An empty list relies on the pairing code alone.
 
 Reply to any notification to send feedback to that session. If no reply target
 is set, the active session from `/use` is used.
+
+`/new` creates a session and makes it active. Without a directory it uses the
+active session's directory, then `opencode.directory`, then the server default.
 
 Notifications also include inline buttons:
 

@@ -128,6 +128,8 @@
         naersk' = pkgs.callPackage naersk { };
         package = naersk'.buildPackage {
           src = ./.;
+          rustc = rust;
+          cargo = rust;
         };
         devShell =
           with pkgs;

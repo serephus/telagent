@@ -1,5 +1,6 @@
 use anyhow::Result;
-use rand::{Rng, distributions::Alphanumeric};
+use rand::RngExt;
+use rand::distr::{Alphanumeric, Distribution};
 use sha2::{Digest, Sha256};
 
 use crate::state::{Db, now};
@@ -21,10 +22,10 @@ pub fn hash_code(code: &str) -> String {
 }
 
 pub fn generate_code() -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let raw: String = (0..8)
         .map(|_| {
-            let index = rng.gen_range(0..ALPHABET.len());
+            let index = rng.random_range(0..ALPHABET.len());
             ALPHABET[index] as char
         })
         .collect();
@@ -45,8 +46,8 @@ pub async fn consume_pairing_code(db: &Db, code: &str) -> Result<Option<String>>
 
 #[allow(dead_code)]
 fn random_string(length: usize) -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
+    Alphanumeric
+        .sample_iter(rand::rng())
         .take(length)
         .map(char::from)
         .collect()

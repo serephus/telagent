@@ -189,9 +189,6 @@ with text. For multiple questions, send one answer per line.
 See `examples/config.toml`. The service uses
 `~/.local/state/telagent/state.redb` unless `storage.path` is set.
 
-State was moved from SQLite to redb. Existing `state.db` files are not migrated;
-re-run `telagent pair` after switching.
-
 Telegram connectivity can use a proxy:
 
 ```toml

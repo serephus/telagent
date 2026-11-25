@@ -16,6 +16,8 @@ pub trait OpenCodeBackend: Send + Sync {
 
     async fn list_sessions(&self) -> anyhow::Result<Vec<SessionInfo>>;
 
+    async fn get_session(&self, session_id: &str) -> anyhow::Result<Option<SessionInfo>>;
+
     async fn create_session(&self, directory: &str) -> anyhow::Result<SessionInfo>;
 
     async fn session_statuses(&self) -> anyhow::Result<HashMap<String, SessionStatus>>;

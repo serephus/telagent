@@ -238,18 +238,20 @@ impl OpenCodeBackend for V2Http {
         Ok(response
             .data
             .into_iter()
-            .map(|session| SessionInfo {
-                id: session.id,
-                title: session.title.unwrap_or_default(),
-                directory: session
-                    .location
-                    .as_ref()
-                    .map(|location| location.directory.clone())
-                    .unwrap_or_default(),
-                project_id: session.project_id,
-                parent_id: session.parent_id,
-            })
+            .map(session_info_from_v2_session)
             .collect())
+    }
+
+    async fn get_session(&self, session_id: &str) -> Result<Option<SessionInfo>> {
+        let response = self
+            .request(reqwest::Method::GET, &format!("/api/session/{session_id}"))
+            .send()
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response: CreateSessionResponse = decode(response).await?;
+        Ok(Some(session_info_from_v2_session(response.data)))
     }
 
     async fn create_session(&self, directory: &str) -> Result<SessionInfo> {
@@ -267,17 +269,7 @@ impl OpenCodeBackend for V2Http {
                 &json!({"location": {"directory": directory}}),
             )
             .await?;
-        let session = response.data;
-        Ok(SessionInfo {
-            id: session.id,
-            title: session.title.unwrap_or_default(),
-            directory: session
-                .location
-                .map(|location| location.directory)
-                .unwrap_or(directory),
-            project_id: session.project_id,
-            parent_id: session.parent_id,
-        })
+        Ok(session_info_from_v2_session(response.data))
     }
 
     async fn session_statuses(&self) -> Result<HashMap<String, SessionStatus>> {
@@ -431,6 +423,19 @@ struct V2Session {
 #[derive(Debug, Deserialize)]
 struct V2Location {
     directory: String,
+}
+
+fn session_info_from_v2_session(session: V2Session) -> SessionInfo {
+    SessionInfo {
+        id: session.id,
+        title: session.title.unwrap_or_default(),
+        directory: session
+            .location
+            .map(|location| location.directory)
+            .unwrap_or_default(),
+        project_id: session.project_id,
+        parent_id: session.parent_id,
+    }
 }
 
 #[derive(Debug, Deserialize)]

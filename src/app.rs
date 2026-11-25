@@ -45,12 +45,16 @@ impl AppState {
     }
 
     pub async fn session_directory(&self, session_id: &str) -> Result<String> {
-        Ok(self
-            .db
-            .get_session(&self.instance_id, session_id)
-            .await?
-            .map(|session| session.directory)
-            .unwrap_or_default())
+        if let Some(session) = self.db.get_session(&self.instance_id, session_id).await?
+            && !session.directory.is_empty()
+        {
+            return Ok(session.directory);
+        }
+        let Some(info) = self.backend.get_session(session_id).await? else {
+            return Ok(String::new());
+        };
+        let session = self.sync_session(&info, "").await?;
+        Ok(session.directory)
     }
 
     pub async fn sync_session(&self, info: &SessionInfo, state: &str) -> Result<SessionRecord> {

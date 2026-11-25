@@ -65,6 +65,22 @@ impl V1Http {
         decode(response).await
     }
 
+    async fn get_json_optional<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        directory: &str,
+    ) -> Result<Option<T>> {
+        let response = self
+            .request(reqwest::Method::GET, path)
+            .query(&directory_query(directory))
+            .send()
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        decode(response).await.map(Some)
+    }
+
     async fn post_json<B: Serialize>(&self, path: &str, directory: &str, body: &B) -> Result<()> {
         let response = self
             .request(reqwest::Method::POST, path)
@@ -112,6 +128,11 @@ impl OpenCodeBackend for V1Http {
 
     async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
         self.get_json("/session", "").await
+    }
+
+    async fn get_session(&self, session_id: &str) -> Result<Option<SessionInfo>> {
+        self.get_json_optional(&format!("/session/{session_id}"), "")
+            .await
     }
 
     async fn create_session(&self, directory: &str) -> Result<SessionInfo> {
@@ -420,6 +441,30 @@ mod tests {
                 .map(String::as_str),
             Some("/tmp/project")
         );
+    }
+
+    #[tokio::test]
+    async fn fetches_session_by_id() {
+        let router = Router::new().route(
+            "/session/{session_id}",
+            get(|| async {
+                Json(json!({
+                    "id": "ses_1",
+                    "title": "Test session",
+                    "directory": "/tmp/project"
+                }))
+            }),
+        );
+        let url = spawn(router).await;
+        let config = OpenCodeConfig {
+            url,
+            ..Default::default()
+        };
+        let client = V1Http::new(&config).unwrap();
+
+        let session = client.get_session("ses_1").await.unwrap().unwrap();
+        assert_eq!(session.id, "ses_1");
+        assert_eq!(session.directory, "/tmp/project");
     }
 
     #[tokio::test]

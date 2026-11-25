@@ -142,6 +142,32 @@ impl OpenCodeBackend for V1Http {
         self.post_json_decode("/session", directory, &Body {}).await
     }
 
+    async fn compact_session(&self, session_id: &str, directory: &str) -> Result<()> {
+        let session = self
+            .get_session(session_id)
+            .await?
+            .context("session not found")?;
+        let model = session.model.context("session has no model")?;
+
+        #[derive(Serialize)]
+        struct Body {
+            #[serde(rename = "providerID")]
+            provider_id: String,
+            #[serde(rename = "modelID")]
+            model_id: String,
+        }
+
+        self.post_json(
+            &format!("/session/{session_id}/summarize"),
+            directory,
+            &Body {
+                provider_id: model.provider_id,
+                model_id: model.id,
+            },
+        )
+        .await
+    }
+
     async fn session_statuses(&self) -> Result<HashMap<String, SessionStatus>> {
         self.get_json("/session/status", "").await
     }
@@ -465,6 +491,47 @@ mod tests {
         let session = client.get_session("ses_1").await.unwrap().unwrap();
         assert_eq!(session.id, "ses_1");
         assert_eq!(session.directory, "/tmp/project");
+    }
+
+    #[tokio::test]
+    async fn compacts_session() {
+        let captured = Arc::new(Mutex::new(None));
+        let handler_state = captured.clone();
+        let summarize = post(move |Json(body): Json<Value>| {
+            let captured = handler_state.clone();
+            async move {
+                *captured.lock().unwrap() = Some(body);
+                AxumStatus::OK
+            }
+        });
+        let router = Router::new()
+            .route(
+                "/session/{session_id}",
+                get(|| async {
+                    Json(json!({
+                        "id": "ses_1",
+                        "title": "Test session",
+                        "directory": "/tmp/project",
+                        "model": {"id": "gpt-5", "providerID": "openai"}
+                    }))
+                }),
+            )
+            .route("/session/{session_id}/summarize", summarize);
+        let url = spawn(router).await;
+        let config = OpenCodeConfig {
+            url,
+            ..Default::default()
+        };
+        let client = V1Http::new(&config).unwrap();
+
+        client
+            .compact_session("ses_1", "/tmp/project")
+            .await
+            .unwrap();
+        let body = captured.lock().unwrap();
+        let body = body.as_ref().unwrap();
+        assert_eq!(body["providerID"], "openai");
+        assert_eq!(body["modelID"], "gpt-5");
     }
 
     #[tokio::test]

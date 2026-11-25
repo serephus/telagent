@@ -11,6 +11,15 @@ pub struct SessionInfo {
     pub project_id: Option<String>,
     #[serde(rename = "parentID", default)]
     pub parent_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<SessionModel>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionModel {
+    pub id: String,
+    #[serde(rename = "providerID")]
+    pub provider_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

@@ -155,6 +155,7 @@ and interact with the bot. An empty list relies on the pairing code alone.
 /bind CODE
 /unbind
 /new [DIRECTORY]
+/compact [ID]
 /sessions
 /use ID
 /status
@@ -169,6 +170,8 @@ is set, the active session from `/use` is used.
 
 `/new` creates a session and makes it active. Without a directory it uses the
 active session's directory, then `opencode.directory`, then the server default.
+
+`/compact` compacts the active session with its current model.
 
 Notifications also include inline buttons:
 

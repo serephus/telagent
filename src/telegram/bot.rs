@@ -222,6 +222,25 @@ async fn handle_command(
                 }
             }
         }
+        "compact" => {
+            let Some(session_id) = resolve_session_id(state, chat_id.0, args).await? else {
+                send(bot, chat_id, "No active session. Pass a session ID.").await?;
+                return Ok(());
+            };
+            send(bot, chat_id, format!("Compacting {session_id}...")).await?;
+            match state
+                .backend
+                .compact_session(&session_id, &state.session_directory(&session_id).await?)
+                .await
+            {
+                Ok(()) => {
+                    send(bot, chat_id, format!("Compacted {session_id}.")).await?;
+                }
+                Err(error) => {
+                    send(bot, chat_id, format!("Compaction failed: {error}")).await?;
+                }
+            }
+        }
         "sessions" => {
             send_sessions(bot, state, chat_id).await?;
         }

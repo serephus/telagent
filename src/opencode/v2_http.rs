@@ -14,7 +14,8 @@ use crate::{
         backend::{AgentEvent, EventStream, OpenCodeBackend},
         types::{
             MessageInfo, MessageTime, MessageWithParts, Part, PermissionReply, PermissionRequest,
-            QuestionInfo, QuestionOption, QuestionRequest, RawEvent, SessionInfo, SessionStatus,
+            QuestionInfo, QuestionOption, QuestionRequest, RawEvent, SessionInfo, SessionModel,
+            SessionStatus,
         },
     },
 };
@@ -272,6 +273,11 @@ impl OpenCodeBackend for V2Http {
         Ok(session_info_from_v2_session(response.data))
     }
 
+    async fn compact_session(&self, session_id: &str, _directory: &str) -> Result<()> {
+        self.post_empty(&format!("/api/session/{session_id}/compact"))
+            .await
+    }
+
     async fn session_statuses(&self) -> Result<HashMap<String, SessionStatus>> {
         let response: ActiveResponse = self.get_json("/api/session/active").await?;
         Ok(response
@@ -418,6 +424,15 @@ struct V2Session {
     parent_id: Option<String>,
     #[serde(default)]
     location: Option<V2Location>,
+    #[serde(default)]
+    model: Option<V2Model>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2Model {
+    id: String,
+    #[serde(rename = "providerID")]
+    provider_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -435,6 +450,12 @@ fn session_info_from_v2_session(session: V2Session) -> SessionInfo {
             .unwrap_or_default(),
         project_id: session.project_id,
         parent_id: session.parent_id,
+        model: session
+            .model
+            .map(|model| crate::opencode::types::SessionModel {
+                id: model.id,
+                provider_id: model.provider_id,
+            }),
     }
 }
 
@@ -627,6 +648,12 @@ fn session_info_from_v2(data: &Value) -> Option<SessionInfo> {
             .get("parentID")
             .and_then(Value::as_str)
             .map(str::to_string),
+        model: data.get("model").and_then(|model| {
+            Some(SessionModel {
+                id: model.get("id")?.as_str()?.to_string(),
+                provider_id: model.get("providerID")?.as_str()?.to_string(),
+            })
+        }),
     })
 }
 
@@ -1079,6 +1106,10 @@ mod integration_tests {
                 post(|| async { AxumStatus::OK }),
             )
             .route(
+                "/api/session/{session_id}/compact",
+                post(|| async { AxumStatus::NO_CONTENT }),
+            )
+            .route(
                 "/api/session/{session_id}/permission/{request_id}/reply",
                 permission,
             )
@@ -1129,6 +1160,7 @@ mod integration_tests {
         );
 
         client.abort("ses_1", "").await.unwrap();
+        client.compact_session("ses_1", "").await.unwrap();
 
         client
             .reply_permission("ses_1", "", "per_1", PermissionReply::Once)

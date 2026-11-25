@@ -20,6 +20,8 @@ pub trait OpenCodeBackend: Send + Sync {
 
     async fn create_session(&self, directory: &str) -> anyhow::Result<SessionInfo>;
 
+    async fn compact_session(&self, session_id: &str, directory: &str) -> anyhow::Result<()>;
+
     async fn session_statuses(&self) -> anyhow::Result<HashMap<String, SessionStatus>>;
 
     async fn messages(

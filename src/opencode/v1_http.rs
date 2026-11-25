@@ -13,8 +13,8 @@ use crate::{
     opencode::{
         backend::{EventStream, OpenCodeBackend},
         types::{
-            MessageWithParts, PermissionReply, PermissionRequest, RawEvent, SessionContext,
-            SessionInfo, SessionStatus,
+            MessageWithParts, PermissionReply, PermissionRequest, QuestionRequest, RawEvent,
+            SessionContext, SessionInfo, SessionStatus,
         },
     },
 };
@@ -298,6 +298,17 @@ impl OpenCodeBackend for V1Http {
                 .into_iter()
                 .map(|permission| permission.id)
                 .collect(),
+        ))
+    }
+
+    async fn pending_question_ids(
+        &self,
+        _session_id: &str,
+        directory: &str,
+    ) -> Result<Option<HashSet<String>>> {
+        let questions: Vec<QuestionRequest> = self.get_json("/question", directory).await?;
+        Ok(Some(
+            questions.into_iter().map(|question| question.id).collect(),
         ))
     }
 
@@ -668,19 +679,30 @@ mod tests {
 
     #[tokio::test]
     async fn lists_pending_permission_ids() {
-        let router = Router::new().route(
-            "/permission",
-            get(|| async {
-                Json(json!([{
-                    "id": "per_1",
-                    "sessionID": "ses_1",
-                    "permission": "read",
-                    "patterns": ["/tmp/.env"],
-                    "metadata": {},
-                    "always": []
-                }]))
-            }),
-        );
+        let router = Router::new()
+            .route(
+                "/permission",
+                get(|| async {
+                    Json(json!([{
+                        "id": "per_1",
+                        "sessionID": "ses_1",
+                        "permission": "read",
+                        "patterns": ["/tmp/.env"],
+                        "metadata": {},
+                        "always": []
+                    }]))
+                }),
+            )
+            .route(
+                "/question",
+                get(|| async {
+                    Json(json!([{
+                        "id": "que_1",
+                        "sessionID": "ses_1",
+                        "questions": []
+                    }]))
+                }),
+            );
         let url = spawn(router).await;
         let config = OpenCodeConfig {
             url,
@@ -694,6 +716,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(ids.contains("per_1"));
+
+        let ids = client
+            .pending_question_ids("ses_1", "/tmp")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ids.contains("que_1"));
     }
 
     #[tokio::test]

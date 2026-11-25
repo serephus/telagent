@@ -55,11 +55,11 @@ pub async fn reconcile_loop(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
     loop {
         interval.tick().await;
-        reconcile_pending_permissions(&state).await;
+        reconcile_pending_requests(&state).await;
     }
 }
 
-async fn reconcile_pending_permissions(state: &AppState) {
+async fn reconcile_pending_requests(state: &AppState) {
     let requests = match state.db.list_pending_requests().await {
         Ok(requests) => requests,
         Err(error) => {
@@ -68,13 +68,15 @@ async fn reconcile_pending_permissions(state: &AppState) {
         }
     };
 
-    let mut checked: HashMap<String, Option<HashSet<String>>> = HashMap::new();
+    let mut checked: HashMap<(String, String), Option<HashSet<String>>> = HashMap::new();
     let mut stale: HashSet<String> = HashSet::new();
-    for request in requests
-        .into_iter()
-        .filter(|request| request.kind == "permission")
-    {
-        let ids = if let Some(ids) = checked.get(&request.session_id) {
+    for request in requests {
+        if request.kind != "permission" && request.kind != "question" {
+            continue;
+        }
+
+        let cache_key = (request.kind.clone(), request.session_id.clone());
+        let ids = if let Some(ids) = checked.get(&cache_key) {
             ids.clone()
         } else {
             let directory = match state.session_directory(&request.session_id).await {
@@ -84,18 +86,28 @@ async fn reconcile_pending_permissions(state: &AppState) {
                     continue;
                 }
             };
-            let ids = match state
-                .backend
-                .pending_permission_ids(&request.session_id, &directory)
-                .await
-            {
+            let ids = match request.kind.as_str() {
+                "permission" => {
+                    state
+                        .backend
+                        .pending_permission_ids(&request.session_id, &directory)
+                        .await
+                }
+                _ => {
+                    state
+                        .backend
+                        .pending_question_ids(&request.session_id, &directory)
+                        .await
+                }
+            };
+            let ids = match ids {
                 Ok(ids) => ids,
                 Err(error) => {
-                    tracing::warn!(%error, session_id = %request.session_id, "failed to list pending permissions");
+                    tracing::warn!(%error, session_id = %request.session_id, kind = %request.kind, "failed to list pending requests");
                     continue;
                 }
             };
-            checked.insert(request.session_id.clone(), ids.clone());
+            checked.insert(cache_key, ids.clone());
             ids
         };
 
@@ -104,7 +116,7 @@ async fn reconcile_pending_permissions(state: &AppState) {
             && stale.insert(request.request_id.clone())
             && let Err(error) = state.forget_pending_request(&request.request_id).await
         {
-            tracing::warn!(%error, request_id = %request.request_id, "failed to remove stale permission request");
+            tracing::warn!(%error, request_id = %request.request_id, kind = %request.kind, "failed to remove stale request");
         }
     }
 }

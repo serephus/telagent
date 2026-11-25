@@ -63,6 +63,12 @@ pub trait OpenCodeBackend: Send + Sync {
         directory: &str,
     ) -> anyhow::Result<Option<HashSet<String>>>;
 
+    async fn pending_question_ids(
+        &self,
+        session_id: &str,
+        directory: &str,
+    ) -> anyhow::Result<Option<HashSet<String>>>;
+
     async fn reply_question(
         &self,
         session_id: &str,

@@ -209,10 +209,10 @@ single question. For custom or multi-question requests, reply to the message
 with text. For multiple questions, send one answer per line.
 
 Permission confirmations include the permission name and patterns. Pending
-permission requests are reconciled with opencode, so expired or already
-answered requests are removed and their original Telegram messages are
-deleted; the confirmation reply stays in history. Link previews are disabled
-in bot messages.
+permission and question requests are reconciled with opencode, so expired or
+already answered requests are removed and their original Telegram messages are
+deleted. Permission confirmation replies stay in history. Link previews are
+disabled in bot messages.
 
 ## Configuration
 

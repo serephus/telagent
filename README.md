@@ -269,11 +269,10 @@ url = "http://127.0.0.1:4096"
 # password_file = "/run/secrets/opencode-server-password"
 ```
 
-The V2 adapter uses `/api/event`, `/api/session/active`,
+The V2 adapter uses `/api/event`, `/api/session`, `/api/session/active`,
 `/api/session/{id}/message`, `/api/session/{id}/prompt`,
-`/api/session/{id}/interrupt`, permission replies, and form replies. V2 forms
-are mapped onto the Telegram question flow; typed fields such as booleans,
-numbers, and multiselects are converted back into `Form.Answer` values.
+`/api/session/{id}/interrupt`, `/api/session/{id}/compact`, permission replies,
+and question replies. Questions are mapped onto the Telegram question flow.
 
 Automatic V2 service discovery is available:
 

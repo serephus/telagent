@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use teloxide::{
     Bot,
@@ -8,10 +10,13 @@ use teloxide::{
 
 use crate::{
     config::Config,
-    opencode::types::{PermissionRequest, QuestionRequest, SessionContext},
+    opencode::{
+        OpenCodeBackend,
+        types::{PermissionRequest, QuestionRequest, SessionContext},
+    },
     paste::PasteClient,
     render,
-    state::{Db, NewNotification, SessionRecord},
+    state::{Db, NewNotification, NotificationOutboxItem, SessionRecord},
 };
 
 const MAX_NOTIFICATION_ATTEMPTS: i64 = 50;
@@ -21,16 +26,25 @@ pub struct Notifier {
     bot: Bot,
     config: Config,
     db: Db,
+    backend: Arc<dyn OpenCodeBackend>,
     paste: PasteClient,
     instance_id: String,
 }
 
 impl Notifier {
-    pub fn new(bot: Bot, config: Config, db: Db, paste: PasteClient, instance_id: String) -> Self {
+    pub fn new(
+        bot: Bot,
+        config: Config,
+        db: Db,
+        backend: Arc<dyn OpenCodeBackend>,
+        paste: PasteClient,
+        instance_id: String,
+    ) -> Self {
         Self {
             bot,
             config,
             db,
+            backend,
             paste,
             instance_id,
         }
@@ -74,6 +88,35 @@ impl Notifier {
             if !self.db.is_bound(item.chat_id).await? {
                 let _ = self.db.remove_notification(&item.key).await;
                 continue;
+            }
+
+            if matches!(item.kind.as_str(), "permission" | "question") {
+                match self.request_still_pending(&item).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::info!(
+                            session_id = %item.session_id,
+                            request_id = %item.message_id,
+                            kind = %item.kind,
+                            "dropping notification for a resolved request"
+                        );
+                        self.db.remove_notification(&item.key).await?;
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = %item.session_id,
+                            request_id = %item.message_id,
+                            %error,
+                            "failed to validate pending request"
+                        );
+                        let attempts = self.db.increment_notification_attempts(&item.key).await?;
+                        if attempts >= MAX_NOTIFICATION_ATTEMPTS {
+                            self.db.remove_notification(&item.key).await?;
+                        }
+                        continue;
+                    }
+                }
             }
 
             let markup = item
@@ -126,6 +169,37 @@ impl Notifier {
             }
         }
         Ok(())
+    }
+
+    async fn request_still_pending(&self, item: &NotificationOutboxItem) -> Result<bool> {
+        let Some(session) = self
+            .db
+            .get_session(&self.instance_id, &item.session_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let mut directory = session.directory;
+        if directory.is_empty()
+            && let Some(info) = self.backend.get_session(&item.session_id).await?
+        {
+            directory = info.directory;
+        }
+
+        let pending = match item.kind.as_str() {
+            "permission" => {
+                self.backend
+                    .pending_permission_ids(&item.session_id, &directory)
+                    .await?
+            }
+            "question" => {
+                self.backend
+                    .pending_question_ids(&item.session_id, &directory)
+                    .await?
+            }
+            _ => return Ok(true),
+        };
+        Ok(request_is_pending(pending, &item.message_id))
     }
 
     pub async fn notify_error(
@@ -401,6 +475,15 @@ fn unique_notification_id(kind: &str) -> String {
     format!("{kind}:{}", uuid::Uuid::new_v4())
 }
 
+fn request_is_pending(
+    pending: Option<std::collections::HashSet<String>>,
+    request_id: &str,
+) -> bool {
+    pending
+        .map(|pending| pending.contains(request_id))
+        .unwrap_or(true)
+}
+
 type NotificationMarkup = Vec<Vec<(String, String)>>;
 
 fn completion_markup(session_id: &str) -> NotificationMarkup {
@@ -458,4 +541,24 @@ fn inline_markup(markup: &NotificationMarkup) -> InlineKeyboardMarkup {
             })
             .collect::<Vec<_>>(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn pending_request_check_handles_unknown_and_resolved_requests() {
+        assert!(request_is_pending(None, "req_1"));
+        assert!(request_is_pending(
+            Some(HashSet::from(["req_1".to_string()])),
+            "req_1"
+        ));
+        assert!(!request_is_pending(
+            Some(HashSet::from(["req_2".to_string()])),
+            "req_1"
+        ));
+    }
 }

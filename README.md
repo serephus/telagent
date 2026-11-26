@@ -218,7 +218,8 @@ Completion, error, permission, and question notifications are written to a
 durable per-chat outbox before they are sent. If Telegram or the proxy is
 unavailable, delivery is retried with exponential backoff instead of being
 dropped. Permission and question requests become answerable only after their
-message is delivered. If fetching a completion result fails, the session is
+message is delivered, and retries re-check opencode first so already-resolved
+requests are discarded. If fetching a completion result fails, the session is
 marked notification-pending and retried by the periodic reconciler.
 
 ## Permissions and questions

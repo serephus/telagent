@@ -91,6 +91,7 @@ async fn run_daemon(config: Config) -> Result<()> {
         bot.clone(),
         config.clone(),
         db.clone(),
+        backend.clone(),
         paste.clone(),
         instance_id.clone(),
     );

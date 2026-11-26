@@ -1,3 +1,3 @@
 pub mod db;
 
-pub use db::{Db, NewNotification, PendingRequest, SessionRecord, now};
+pub use db::{Db, NewNotification, NotificationOutboxItem, PendingRequest, SessionRecord, now};

@@ -36,6 +36,31 @@ pub fn session_title(session: &SessionRecord) -> &str {
     }
 }
 
+pub fn history_message(session: &SessionRecord, messages: &[MessageWithParts]) -> String {
+    let mut text = format!(
+        "# {}\n\nSession: {}\nDirectory: {}\n",
+        session_title(session),
+        session.session_id,
+        session.directory
+    );
+    for message in messages {
+        let body = message.text();
+        if body.trim().is_empty() {
+            continue;
+        }
+        text.push_str("\n---\n\n## ");
+        text.push_str(if message.is_assistant() {
+            "Assistant"
+        } else {
+            "User"
+        });
+        text.push_str("\n\n");
+        text.push_str(body.trim());
+        text.push('\n');
+    }
+    text
+}
+
 pub fn completion_message(
     session: &SessionRecord,
     body: Option<&str>,
@@ -240,5 +265,53 @@ mod tests {
         let message = completion_message(&session, None, Some(&context));
         assert!(message.contains("Model: gpt-5"));
         assert!(message.contains("Context: 75% (750k/1.0M)"));
+    }
+
+    #[test]
+    fn history_message_includes_roles_and_text() {
+        let session = SessionRecord {
+            instance_id: "instance".to_string(),
+            session_id: "ses_1".to_string(),
+            title: "Test".to_string(),
+            directory: "/tmp".to_string(),
+            project_id: None,
+            parent_id: None,
+            state: "idle".to_string(),
+            last_assistant_message_id: None,
+            last_notified_message_id: None,
+            muted: false,
+            updated_at: 0,
+        };
+        let messages = vec![
+            MessageWithParts {
+                info: crate::opencode::types::MessageInfo {
+                    id: "msg_1".to_string(),
+                    role: "user".to_string(),
+                    time: Default::default(),
+                    tokens: Default::default(),
+                },
+                parts: vec![crate::opencode::types::Part {
+                    kind: "text".to_string(),
+                    text: Some("hello".to_string()),
+                }],
+            },
+            MessageWithParts {
+                info: crate::opencode::types::MessageInfo {
+                    id: "msg_2".to_string(),
+                    role: "assistant".to_string(),
+                    time: Default::default(),
+                    tokens: Default::default(),
+                },
+                parts: vec![crate::opencode::types::Part {
+                    kind: "text".to_string(),
+                    text: Some("hi there".to_string()),
+                }],
+            },
+        ];
+
+        let history = history_message(&session, &messages);
+        assert!(history.contains("# Test"));
+        assert!(history.contains("## User\n\nhello"));
+        assert!(history.contains("## Assistant\n\nhi there"));
     }
 }

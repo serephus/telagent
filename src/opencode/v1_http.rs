@@ -237,6 +237,11 @@ impl OpenCodeBackend for V1Http {
         .await
     }
 
+    async fn history(&self, session_id: &str, directory: &str) -> Result<Vec<MessageWithParts>> {
+        self.get_json(&format!("/session/{session_id}/message"), directory)
+            .await
+    }
+
     async fn prompt_async(&self, session_id: &str, directory: &str, text: &str) -> Result<()> {
         #[derive(Serialize)]
         struct TextPart<'a> {

@@ -427,8 +427,88 @@ async fn handle_command(
                 }
             }
         }
+        "export" => {
+            export_history(bot, state, chat_id, parsed.raw_args, reply_session_id).await?;
+        }
         other => {
             send(bot, chat_id, format!("Unknown command: /{other}")).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn export_history(
+    bot: &Bot,
+    state: &AppState,
+    chat_id: ChatId,
+    raw_args: &str,
+    reply_session_id: Option<&str>,
+) -> Result<()> {
+    let options = match parse_export_args(raw_args) {
+        Ok(options) => options,
+        Err(error) => {
+            send(
+                bot,
+                chat_id,
+                format!("Usage: /export [ID] [--title TITLE] [--reveal TIME]\n{error}"),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let session_id = match options.session_id {
+        Some(session_id) => session_id,
+        None => match reply_session_id {
+            Some(session_id) => session_id.to_string(),
+            None => match state.db.active_session(chat_id.0).await? {
+                Some(session_id) => session_id,
+                None => {
+                    send(bot, chat_id, "No active session. Pass a session ID.").await?;
+                    return Ok(());
+                }
+            },
+        },
+    };
+
+    send(bot, chat_id, format!("Exporting {session_id} history...")).await?;
+
+    let directory = state.session_directory(&session_id).await?;
+    let session = state.get_or_placeholder_session(&session_id).await?;
+    let messages = match state.backend.history(&session_id, &directory).await {
+        Ok(messages) => messages,
+        Err(error) => {
+            send(bot, chat_id, format!("Export failed: {error}")).await?;
+            return Ok(());
+        }
+    };
+    if messages.is_empty() {
+        send(bot, chat_id, "No history to export.").await?;
+        return Ok(());
+    }
+
+    let text = render::history_message(&session, &messages);
+    let title = options
+        .title
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| render::session_title(&session).to_string());
+    let reveal = options
+        .reveal
+        .as_deref()
+        .filter(|reveal| !reveal.eq_ignore_ascii_case("now"));
+
+    match state.paste.upload(&text, &title, reveal).await {
+        Ok(url) => {
+            send(
+                bot,
+                chat_id,
+                format!("Exported {session_id} history to {url}"),
+            )
+            .await?;
+        }
+        Err(error) => {
+            send(bot, chat_id, format!("Export failed: {error}")).await?;
         }
     }
 
@@ -827,6 +907,78 @@ fn parse_command(text: &str) -> Option<ParsedCommand<'_>> {
     })
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ExportArgs {
+    session_id: Option<String>,
+    title: Option<String>,
+    reveal: Option<String>,
+}
+
+fn parse_export_args(input: &str) -> std::result::Result<ExportArgs, String> {
+    let mut options = ExportArgs::default();
+    let mut tokens = split_args(input).into_iter();
+    while let Some(token) = tokens.next() {
+        match token.as_str() {
+            "--title" => match tokens.next() {
+                Some(value) => options.title = Some(value),
+                None => return Err("--title requires a value".to_string()),
+            },
+            "--reveal" => match tokens.next() {
+                Some(value) => options.reveal = Some(value),
+                None => return Err("--reveal requires a value".to_string()),
+            },
+            value if value.starts_with("--") => {
+                return Err(format!("unknown option {value}"));
+            }
+            value if options.session_id.is_none() => {
+                options.session_id = Some(value.to_string());
+            }
+            value => return Err(format!("unexpected argument {value}")),
+        }
+    }
+    Ok(options)
+}
+
+fn split_args(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut started = false;
+
+    for ch in input.chars() {
+        match quote {
+            Some(expected) => {
+                if ch == expected {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+                started = true;
+            }
+            None => match ch {
+                '"' | '\'' => {
+                    quote = Some(ch);
+                    started = true;
+                }
+                ch if ch.is_whitespace() => {
+                    if started {
+                        args.push(std::mem::take(&mut current));
+                        started = false;
+                    }
+                }
+                ch => {
+                    current.push(ch);
+                    started = true;
+                }
+            },
+        }
+    }
+    if started {
+        args.push(current);
+    }
+    args
+}
+
 fn parse_new_args(input: &str) -> (Option<String>, Option<String>) {
     let input = input.trim();
     if input.is_empty() {
@@ -928,6 +1080,30 @@ mod tests {
                 Some("/tmp/project".to_string()),
                 Some("fix the build".to_string())
             )
+        );
+    }
+
+    #[test]
+    fn parses_export_options() {
+        assert_eq!(
+            parse_export_args("ses_1 --title \"Release notes\" --reveal '2030-01-01 00:00'"),
+            Ok(ExportArgs {
+                session_id: Some("ses_1".to_string()),
+                title: Some("Release notes".to_string()),
+                reveal: Some("2030-01-01 00:00".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_export_options_without_values() {
+        assert_eq!(
+            parse_export_args("--title"),
+            Err("--title requires a value".to_string())
+        );
+        assert_eq!(
+            parse_export_args("--reveal"),
+            Err("--reveal requires a value".to_string())
         );
     }
 }

@@ -20,6 +20,9 @@ use crate::{
     },
 };
 
+const HISTORY_PAGE_SIZE: usize = 200;
+const MAX_HISTORY_PAGES: usize = 1000;
+
 #[derive(Clone)]
 pub struct V2Http {
     client: Client,
@@ -349,6 +352,28 @@ impl OpenCodeBackend for V2Http {
         Ok(response.data.iter().filter_map(normalize_message).collect())
     }
 
+    async fn history(&self, session_id: &str, _directory: &str) -> Result<Vec<MessageWithParts>> {
+        let mut messages = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_HISTORY_PAGES {
+            let path = match &cursor {
+                Some(cursor) => format!(
+                    "/api/session/{session_id}/message?limit={HISTORY_PAGE_SIZE}&cursor={cursor}"
+                ),
+                None => {
+                    format!("/api/session/{session_id}/message?limit={HISTORY_PAGE_SIZE}&order=asc")
+                }
+            };
+            let response: MessagesResponse = self.get_json(&path).await?;
+            messages.extend(response.data.iter().filter_map(normalize_message));
+            match response.cursor.next {
+                Some(next) if !next.is_empty() => cursor = Some(next),
+                _ => return Ok(messages),
+            }
+        }
+        bail!("session {session_id} history exceeds {MAX_HISTORY_PAGES} pages")
+    }
+
     async fn prompt_async(&self, session_id: &str, _directory: &str, text: &str) -> Result<()> {
         #[derive(serde::Serialize)]
         struct Body<'a> {
@@ -589,10 +614,19 @@ struct ActiveResponse {
 #[derive(Debug, Deserialize)]
 struct MessagesResponse {
     data: Vec<Value>,
+    #[serde(default)]
+    cursor: MessagesCursor,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MessagesCursor {
+    #[serde(default)]
+    next: Option<String>,
 }
 
 fn normalize_message(value: &Value) -> Option<MessageWithParts> {
-    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+    let role = value.get("type")?.as_str()?;
+    if role != "assistant" && role != "user" {
         return None;
     }
     let id = value.get("id")?.as_str()?.to_string();
@@ -606,30 +640,37 @@ fn normalize_message(value: &Value) -> Option<MessageWithParts> {
         .and_then(|time| time.get("completed"))
         .and_then(number_to_i64);
 
-    let parts = value
-        .get("content")
-        .and_then(Value::as_array)
-        .map(|content| {
-            content
-                .iter()
-                .filter_map(|part| {
-                    if part.get("type").and_then(Value::as_str) == Some("text") {
-                        Some(Part {
-                            kind: "text".to_string(),
-                            text: part.get("text").and_then(Value::as_str).map(str::to_string),
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let parts = if let Some(text) = value.get("text").and_then(Value::as_str) {
+        vec![Part {
+            kind: "text".to_string(),
+            text: Some(text.to_string()),
+        }]
+    } else {
+        value
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|content| {
+                content
+                    .iter()
+                    .filter_map(|part| {
+                        if part.get("type").and_then(Value::as_str) == Some("text") {
+                            Some(Part {
+                                kind: "text".to_string(),
+                                text: part.get("text").and_then(Value::as_str).map(str::to_string),
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
 
     Some(MessageWithParts {
         info: MessageInfo {
             id,
-            role: "assistant".to_string(),
+            role: role.to_string(),
             time: MessageTime { created, completed },
             tokens: tokens_from_v2(value),
         },
@@ -1056,7 +1097,7 @@ mod integration_tests {
 
     use axum::{
         Json, Router,
-        extract::Path,
+        extract::{Path, Query},
         http::{StatusCode as AxumStatus, header},
         routing::{get, post},
     };
@@ -1189,6 +1230,52 @@ mod integration_tests {
             axum::serve(listener, router).await.unwrap();
         });
         format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn fetches_all_history_pages_in_order() {
+        use std::collections::HashMap;
+
+        let router = Router::new().route(
+            "/api/session/{session_id}/message",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                if query.get("cursor").map(String::as_str) == Some("next") {
+                    Json(json!({
+                        "data": [{
+                            "id": "msg_2",
+                            "type": "assistant",
+                            "time": {"created": 2, "completed": 3},
+                            "content": [{"type": "text", "text": "hi"}]
+                        }],
+                        "cursor": {"previous": "previous", "next": null}
+                    }))
+                } else {
+                    Json(json!({
+                        "data": [{
+                            "id": "msg_1",
+                            "type": "user",
+                            "time": {"created": 1},
+                            "text": "hello"
+                        }],
+                        "cursor": {"previous": null, "next": "next"}
+                    }))
+                }
+            }),
+        );
+        let url = spawn(router).await;
+        let client = V2Http::new(&OpenCodeConfig {
+            backend: "v2".to_string(),
+            url,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let messages = client.history("ses_1", "").await.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(!messages[0].is_assistant());
+        assert_eq!(messages[0].text(), "hello");
+        assert!(messages[1].is_assistant());
+        assert_eq!(messages[1].text(), "hi");
     }
 
     #[tokio::test]

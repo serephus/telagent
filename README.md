@@ -116,9 +116,9 @@ homeManager = { pkgs, osConfig, ... }: {
       questions = true;
       includeLastMessage = true;
       childSessions = false;
-
-      paste.enabled = false;
     };
+
+    paste.enabled = false;
   };
 };
 ```
@@ -163,6 +163,7 @@ and interact with the bot. An empty list relies on the pairing code alone.
 /mute [ID]
 /unmute [ID]
 /abort [ID]
+/export [ID] [--title TITLE] [--reveal TIME]
 /help
 ```
 
@@ -172,6 +173,17 @@ is set, the active session from `/use` is used.
 Commands such as `/compact`, `/mute`, and `/abort` also use the replied
 notification's session when sent as a reply. `/cancel` clears the active
 session selection; `/status` shows it with a `*` and reports pending requests.
+
+`/export` uploads the entire session history to the configured cocoon pastebin
+and replies with the URL. It uses the replied notification, an explicit session
+ID, or the active session. The paste title defaults to the session title and can
+be overridden with `--title`. The paste is revealed immediately by default;
+`--reveal` accepts a cocoon publish time such as `2030-01-01`, `2030-01-01 00:00`,
+or `2030-01-01T00:00:00Z` (UTC). Quote values that contain spaces:
+
+```text
+/export --title "Release notes" --reveal "2030-01-01 00:00"
+```
 
 `/new` creates a session and makes it active. Missing directories are created.
 Without a directory it uses the active session's directory, then
@@ -236,17 +248,17 @@ include_last_message = true
 max_telegram_chars = 3900
 child_sessions = false
 
-[notify.paste]
+[paste]
 enabled = false
-provider = "none" # none | paste-rs | zero-zero | custom
-url = ""
+url = "https://cocoon.sereph.us"
 threshold_chars = 12000
 ```
 
 Full messages are sent when they fit. Longer messages are split into numbered
 Telegram chunks. If paste upload is enabled and the message exceeds
-`threshold_chars`, telagent uploads it and sends the URL instead. Paste is
-opt-in because it sends code and possibly secrets to a third party.
+`threshold_chars`, telagent uploads it to [cocoon](https://github.com/serephus/cocoon)
+and sends the URL instead. `/export` also uses this pastebin. Paste is opt-in
+because it sends code and possibly secrets to a third party.
 
 ## Security
 

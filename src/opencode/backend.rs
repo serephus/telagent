@@ -40,6 +40,12 @@ pub trait OpenCodeBackend: Send + Sync {
         limit: usize,
     ) -> anyhow::Result<Vec<MessageWithParts>>;
 
+    async fn history(
+        &self,
+        session_id: &str,
+        directory: &str,
+    ) -> anyhow::Result<Vec<MessageWithParts>>;
+
     async fn prompt_async(
         &self,
         session_id: &str,

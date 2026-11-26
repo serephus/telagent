@@ -31,6 +31,7 @@ let
       health_interval_secs = cfg.opencode.healthIntervalSecs;
       health_timeout_secs = cfg.opencode.healthTimeoutSecs;
       session_stale_secs = cfg.opencode.sessionStaleSecs;
+      event_idle_timeout_secs = cfg.opencode.eventIdleTimeoutSecs;
     }
     // lib.optionalAttrs (cfg.opencode.passwordFile != null) {
       password_file = cfg.opencode.passwordFile;
@@ -178,6 +179,12 @@ in
         type = lib.types.ints.positive;
         default = 900;
         description = "Busy sessions with no updates for this long are reconciled against opencode.";
+      };
+
+      eventIdleTimeoutSecs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 120;
+        description = "Reconnect the opencode event stream after this many seconds without events.";
       };
     };
 

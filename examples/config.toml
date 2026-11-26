@@ -22,6 +22,8 @@ health_interval_secs = 30
 health_timeout_secs = 10
 # Reconcile busy/retry sessions that have had no updates for this many seconds.
 session_stale_secs = 900
+# Force an event-stream reconnect after this many seconds without events.
+event_idle_timeout_secs = 120
 
 [notify]
 on_idle = true

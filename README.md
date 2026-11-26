@@ -231,7 +231,9 @@ seconds. A failed probe marks the backend unreachable and sends one Telegram
 notice; the next successful probe sends a recovery notice. Each check times out
 after `opencode.health_timeout_secs` seconds. Sessions stuck in `busy` or `retry`
 without updates for `opencode.session_stale_secs` are reconciled against the
-server so a missed idle event still produces a result notification.
+server so a missed idle event still produces a result notification. The event
+stream reconnects after `opencode.event_idle_timeout_secs` without events, which
+recovers half-open proxy connections.
 
 ## Permissions and questions
 

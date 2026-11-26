@@ -16,8 +16,10 @@ use crate::{
 };
 
 pub async fn event_loop(state: AppState) {
+    let idle_timeout = Duration::from_secs(state.config.opencode.event_idle_timeout_secs.max(1));
     let mut backoff = 1u64;
     loop {
+        let mut idle_reconnect = false;
         match state.backend.event_stream().await {
             Ok(mut stream) => {
                 backoff = 1;
@@ -25,16 +27,24 @@ pub async fn event_loop(state: AppState) {
                     tracing::warn!(%error, "failed to resync opencode state");
                 }
 
-                while let Some(item) = stream.next().await {
-                    match item {
-                        Ok(raw) => {
+                loop {
+                    match tokio::time::timeout(idle_timeout, stream.next()).await {
+                        Ok(Some(Ok(raw))) => {
                             let event = state.backend.normalize_event(raw);
                             if let Err(error) = handle_event(&state, event).await {
                                 tracing::warn!(%error, "failed to handle opencode event");
                             }
                         }
-                        Err(error) => {
+                        Ok(Some(Err(error))) => {
                             tracing::warn!(%error, "opencode event stream ended");
+                            break;
+                        }
+                        Ok(None) => {
+                            tracing::warn!("opencode event stream closed");
+                            break;
+                        }
+                        Err(_) => {
+                            idle_reconnect = true;
                             break;
                         }
                     }
@@ -45,7 +55,15 @@ pub async fn event_loop(state: AppState) {
             }
         }
 
-        tracing::info!(backoff, "reconnecting to opencode event stream");
+        if idle_reconnect {
+            tracing::debug!(
+                backoff,
+                timeout_secs = idle_timeout.as_secs(),
+                "reconnecting idle opencode event stream"
+            );
+        } else {
+            tracing::info!(backoff, "reconnecting to opencode event stream");
+        }
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
     }

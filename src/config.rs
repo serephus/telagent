@@ -42,6 +42,7 @@ pub struct OpenCodeConfig {
     pub health_interval_secs: u64,
     pub health_timeout_secs: u64,
     pub session_stale_secs: u64,
+    pub event_idle_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -94,6 +95,7 @@ impl Default for OpenCodeConfig {
             health_interval_secs: 30,
             health_timeout_secs: 10,
             session_stale_secs: 900,
+            event_idle_timeout_secs: 120,
         }
     }
 }
@@ -222,6 +224,7 @@ mod tests {
         assert_eq!(config.opencode.health_interval_secs, 30);
         assert_eq!(config.opencode.health_timeout_secs, 10);
         assert_eq!(config.opencode.session_stale_secs, 900);
+        assert_eq!(config.opencode.event_idle_timeout_secs, 120);
         assert_eq!(config.notify.max_telegram_chars, 3900);
         assert_eq!(config.paste.max_bytes, 4 * 1024 * 1024);
         assert!(config.security.require_bind);

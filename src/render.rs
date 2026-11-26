@@ -36,6 +36,197 @@ pub fn session_title(session: &SessionRecord) -> &str {
     }
 }
 
+const HISTORY_SEPARATOR: &str = "\n---\n\n";
+const MIN_HISTORY_LIMIT: usize = 256;
+
+#[derive(Debug, Clone)]
+struct HistoryBlock {
+    heading: &'static str,
+    body: String,
+}
+
+impl HistoryBlock {
+    fn rendered(&self) -> String {
+        format!("{}\n\n{}\n", self.heading, self.body)
+    }
+
+    fn cost(&self) -> usize {
+        self.heading.len() + self.body.len() + 3 + HISTORY_SEPARATOR.len()
+    }
+}
+
+pub fn history_pastes(
+    session: &SessionRecord,
+    messages: &[MessageWithParts],
+    max_bytes: usize,
+) -> Vec<String> {
+    let turns = history_turns(messages);
+    if turns.is_empty() {
+        return Vec::new();
+    }
+
+    let header_len = history_header(session, 1, 1).len();
+    let mut limit = max_bytes.saturating_sub(header_len).max(MIN_HISTORY_LIMIT);
+
+    loop {
+        let split_turns = turns
+            .iter()
+            .flat_map(|turn| split_turn(turn, limit))
+            .collect();
+        let groups = pack_turns(split_turns, limit);
+        let total = groups.len();
+        let pastes = groups
+            .iter()
+            .enumerate()
+            .map(|(index, blocks)| history_paste(session, blocks, index + 1, total))
+            .collect::<Vec<_>>();
+        if pastes.iter().all(|paste| paste.len() <= max_bytes) || limit <= MIN_HISTORY_LIMIT {
+            return pastes;
+        }
+        limit = (limit * 3) / 4;
+    }
+}
+
+fn history_header(session: &SessionRecord, part: usize, total: usize) -> String {
+    format!(
+        "# {}\n\nSession: {}\nDirectory: {}\nPart: {}/{}\n",
+        session_title(session),
+        session.session_id,
+        session.directory,
+        part,
+        total
+    )
+}
+
+fn history_paste(
+    session: &SessionRecord,
+    blocks: &[HistoryBlock],
+    part: usize,
+    total: usize,
+) -> String {
+    let mut text = history_header(session, part, total);
+    for block in blocks {
+        text.push_str(HISTORY_SEPARATOR);
+        text.push_str(&block.rendered());
+    }
+    text
+}
+
+fn history_turns(messages: &[MessageWithParts]) -> Vec<Vec<HistoryBlock>> {
+    let mut turns = Vec::new();
+    let mut current = Vec::new();
+    for message in messages {
+        let body = message.text();
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        if !message.is_assistant() && !current.is_empty() {
+            turns.push(std::mem::take(&mut current));
+        }
+        current.push(HistoryBlock {
+            heading: if message.is_assistant() {
+                "## Assistant"
+            } else {
+                "## User"
+            },
+            body: body.to_string(),
+        });
+    }
+    if !current.is_empty() {
+        turns.push(current);
+    }
+    turns
+}
+
+fn split_turn(turn: &[HistoryBlock], limit: usize) -> Vec<Vec<HistoryBlock>> {
+    let mut blocks = Vec::new();
+    for block in turn {
+        blocks.extend(split_block(block, limit));
+    }
+
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut cost = 0;
+    for block in blocks {
+        let next = block.cost();
+        if !current.is_empty() && cost + next > limit {
+            groups.push(std::mem::take(&mut current));
+            cost = 0;
+        }
+        current.push(block);
+        cost += next;
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
+fn split_block(block: &HistoryBlock, limit: usize) -> Vec<HistoryBlock> {
+    let overhead = block.heading.len() + 3 + HISTORY_SEPARATOR.len();
+    let max_body = limit.saturating_sub(overhead).max(1);
+    if block.body.len() <= max_body {
+        return vec![block.clone()];
+    }
+    split_body_bytes(&block.body, max_body)
+        .into_iter()
+        .map(|body| HistoryBlock {
+            heading: block.heading,
+            body,
+        })
+        .collect()
+}
+
+fn split_body_bytes(text: &str, max_bytes: usize) -> Vec<String> {
+    let max_bytes = max_bytes.max(1);
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + max_bytes).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = start + 1;
+            while end < text.len() && !text.is_char_boundary(end) {
+                end += 1;
+            }
+        }
+        if end < text.len() {
+            let search_start = start + max_bytes / 2;
+            if let Some(offset) = text[start..end].rfind('\n') {
+                let candidate = start + offset + 1;
+                if candidate > search_start {
+                    end = candidate;
+                }
+            }
+        }
+        parts.push(text[start..end].to_string());
+        start = end;
+    }
+    parts
+}
+
+fn pack_turns(turns: Vec<Vec<HistoryBlock>>, limit: usize) -> Vec<Vec<HistoryBlock>> {
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut cost = 0;
+    for turn in turns {
+        let turn_cost = turn.iter().map(HistoryBlock::cost).sum::<usize>();
+        if !current.is_empty() && cost + turn_cost > limit {
+            groups.push(std::mem::take(&mut current));
+            cost = 0;
+        }
+        current.extend(turn);
+        cost += turn_cost;
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
 pub fn completion_message(
     session: &SessionRecord,
     body: Option<&str>,
@@ -228,6 +419,7 @@ mod tests {
             state: "idle".to_string(),
             last_assistant_message_id: None,
             last_notified_message_id: None,
+            notification_pending: false,
             muted: false,
             updated_at: 0,
         };
@@ -240,5 +432,93 @@ mod tests {
         let message = completion_message(&session, None, Some(&context));
         assert!(message.contains("Model: gpt-5"));
         assert!(message.contains("Context: 75% (750k/1.0M)"));
+    }
+
+    fn test_session() -> SessionRecord {
+        SessionRecord {
+            instance_id: "instance".to_string(),
+            session_id: "ses_1".to_string(),
+            title: "Test".to_string(),
+            directory: "/tmp".to_string(),
+            project_id: None,
+            parent_id: None,
+            state: "idle".to_string(),
+            last_assistant_message_id: None,
+            last_notified_message_id: None,
+            notification_pending: false,
+            muted: false,
+            updated_at: 0,
+        }
+    }
+
+    fn test_message(role: &str, text: &str) -> MessageWithParts {
+        MessageWithParts {
+            info: crate::opencode::types::MessageInfo {
+                id: format!("msg_{role}"),
+                role: role.to_string(),
+                time: Default::default(),
+                tokens: Default::default(),
+            },
+            parts: vec![crate::opencode::types::Part {
+                kind: "text".to_string(),
+                text: Some(text.to_string()),
+            }],
+        }
+    }
+
+    #[test]
+    fn history_includes_session_info_roles_and_text() {
+        let session = test_session();
+        let messages = vec![
+            test_message("user", "hello"),
+            test_message("assistant", "hi there"),
+        ];
+
+        let pastes = history_pastes(&session, &messages, 4096);
+        assert_eq!(pastes.len(), 1);
+        let history = &pastes[0];
+        assert!(history.contains("# Test"));
+        assert!(history.contains("Session: ses_1"));
+        assert!(history.contains("Directory: /tmp"));
+        assert!(history.contains("Part: 1/1"));
+        assert!(history.contains("## User\n\nhello"));
+        assert!(history.contains("## Assistant\n\nhi there"));
+    }
+
+    #[test]
+    fn history_splits_at_user_messages() {
+        let session = test_session();
+        let long = "a".repeat(300);
+        let messages = vec![
+            test_message("user", &long),
+            test_message("assistant", &long),
+            test_message("user", &long),
+            test_message("assistant", &long),
+        ];
+
+        let pastes = history_pastes(&session, &messages, 700);
+        assert!(pastes.len() > 1);
+        for paste in &pastes {
+            assert!(paste.len() <= 700);
+            assert!(paste.contains("Session: ses_1"));
+        }
+        assert!(pastes[0].contains("## User\n\n"));
+        assert!(pastes[0].contains(&long));
+        assert!(!pastes[0].contains(&"## User\n\n".repeat(2)));
+        assert!(pastes[1].contains("## User\n\n"));
+    }
+
+    #[test]
+    fn history_splits_oversized_messages() {
+        let session = test_session();
+        let messages = vec![test_message("assistant", &"line\n".repeat(200))];
+
+        let pastes = history_pastes(&session, &messages, 600);
+        assert!(pastes.len() > 1);
+        for paste in &pastes {
+            assert!(paste.len() <= 600);
+            assert!(paste.contains("## Assistant"));
+            assert!(paste.contains("Session: ses_1"));
+        }
     }
 }

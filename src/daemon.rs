@@ -16,25 +16,38 @@ use crate::{
 };
 
 pub async fn event_loop(state: AppState) {
+    let idle_timeout = Duration::from_secs(state.config.opencode.event_idle_timeout_secs.max(1));
     let mut backoff = 1u64;
     loop {
+        let mut idle_reconnect = false;
+        let mut connected = false;
         match state.backend.event_stream().await {
             Ok(mut stream) => {
+                connected = true;
                 backoff = 1;
                 if let Err(error) = resync(&state).await {
                     tracing::warn!(%error, "failed to resync opencode state");
                 }
 
-                while let Some(item) = stream.next().await {
-                    match item {
-                        Ok(raw) => {
+                loop {
+                    match tokio::time::timeout(idle_timeout, stream.next()).await {
+                        Ok(Some(Ok(raw))) => {
+                            state.runtime.mark_event();
                             let event = state.backend.normalize_event(raw);
                             if let Err(error) = handle_event(&state, event).await {
                                 tracing::warn!(%error, "failed to handle opencode event");
                             }
                         }
-                        Err(error) => {
+                        Ok(Some(Err(error))) => {
                             tracing::warn!(%error, "opencode event stream ended");
+                            break;
+                        }
+                        Ok(None) => {
+                            tracing::warn!("opencode event stream closed");
+                            break;
+                        }
+                        Err(_) => {
+                            idle_reconnect = true;
                             break;
                         }
                     }
@@ -45,7 +58,18 @@ pub async fn event_loop(state: AppState) {
             }
         }
 
-        tracing::info!(backoff, "reconnecting to opencode event stream");
+        if connected {
+            state.runtime.inc_event_reconnect();
+        }
+        if idle_reconnect {
+            tracing::debug!(
+                backoff,
+                timeout_secs = idle_timeout.as_secs(),
+                "reconnecting idle opencode event stream"
+            );
+        } else {
+            tracing::info!(backoff, "reconnecting to opencode event stream");
+        }
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
     }
@@ -56,7 +80,111 @@ pub async fn reconcile_loop(state: AppState) {
     loop {
         interval.tick().await;
         reconcile_pending_requests(&state).await;
+        reconcile_pending_notifications(&state).await;
+        if let Err(error) = reconcile_stale_sessions(&state).await {
+            tracing::warn!(%error, "failed to reconcile stale sessions");
+        }
     }
+}
+
+async fn reconcile_pending_notifications(state: &AppState) {
+    let sessions = match state.db.pending_notification_sessions().await {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::warn!(%error, "failed to read pending notifications");
+            return;
+        }
+    };
+    for session in sessions {
+        if session.state == "busy" || session.state == "retry" {
+            continue;
+        }
+        if session.state == "deleted" {
+            let _ = state
+                .db
+                .set_notification_pending(&session.session_id, false)
+                .await;
+            continue;
+        }
+        if let Err(error) = notify_completion(state, &session.session_id).await {
+            tracing::warn!(
+                %error,
+                session_id = %session.session_id,
+                "failed to retry pending completion notification"
+            );
+        }
+    }
+}
+
+async fn reconcile_stale_sessions(state: &AppState) -> Result<()> {
+    let stale_secs = state.config.opencode.session_stale_secs.max(60) as i64;
+    let before = crate::state::now() - stale_secs;
+    let stale = match state.db.stale_sessions(&state.instance_id, before).await {
+        Ok(stale) => stale,
+        Err(error) => {
+            tracing::warn!(%error, "failed to read stale sessions");
+            return Ok(());
+        }
+    };
+    if stale.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(count = stale.len(), "reconciling stale sessions");
+    let statuses = match state.backend.session_statuses().await {
+        Ok(statuses) => statuses,
+        Err(error) => {
+            tracing::warn!(%error, "failed to refresh stale session statuses");
+            return Ok(());
+        }
+    };
+
+    for session in stale {
+        let info = match state.backend.get_session(&session.session_id).await {
+            Ok(Some(info)) => info,
+            Ok(None) => {
+                state
+                    .db
+                    .update_state(&session.session_id, "deleted")
+                    .await?;
+                state
+                    .db
+                    .set_notification_pending(&session.session_id, false)
+                    .await?;
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    session_id = %session.session_id,
+                    "failed to refresh stale session"
+                );
+                continue;
+            }
+        };
+        let previous = state
+            .db
+            .get_session(&state.instance_id, &session.session_id)
+            .await?
+            .map(|session| session.state)
+            .unwrap_or_default();
+        let new_state = statuses
+            .get(&info.id)
+            .map(SessionStatus::as_db_state)
+            .unwrap_or("idle");
+        let synced = state.sync_session(&info, new_state).await?;
+        if matches!(previous.as_str(), "busy" | "retry")
+            && new_state == "idle"
+            && let Err(error) = notify_completion(state, &synced.session_id).await
+        {
+            tracing::warn!(
+                %error,
+                session_id = %synced.session_id,
+                "failed to notify reconciled session"
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn reconcile_pending_requests(state: &AppState) {
@@ -125,7 +253,7 @@ pub async fn outbox_loop(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
         interval.tick().await;
-        let items = match state.db.list_outbox(20).await {
+        let items = match state.db.list_due_outbox(20).await {
             Ok(items) => items,
             Err(error) => {
                 tracing::warn!(%error, "failed to read outbox");
@@ -134,9 +262,28 @@ pub async fn outbox_loop(state: AppState) {
         };
 
         for item in items {
-            if item.next_attempt_at > crate::state::now() {
-                continue;
+            match state
+                .db
+                .get_session(&state.instance_id, &item.session_id)
+                .await
+            {
+                Ok(Some(session)) if session.state == "deleted" => {
+                    tracing::info!(session_id = %item.session_id, "dropping outbox item for deleted session");
+                    let _ = state.db.remove_outbox(item.id).await;
+                    continue;
+                }
+                Ok(None) => {
+                    tracing::info!(session_id = %item.session_id, "dropping outbox item for unknown session");
+                    let _ = state.db.remove_outbox(item.id).await;
+                    continue;
+                }
+                Ok(Some(_)) => {}
+                Err(error) => {
+                    tracing::warn!(%error, session_id = %item.session_id, "failed to read outbox session");
+                    continue;
+                }
             }
+
             let directory = match state.session_directory(&item.session_id).await {
                 Ok(directory) => directory,
                 Err(error) => {
@@ -155,10 +302,16 @@ pub async fn outbox_loop(state: AppState) {
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(%error, session_id = %item.session_id, "outbox delivery failed");
-                    let _ = state.db.increment_outbox_attempts(item.id).await;
-                    if item.attempts + 1 >= 5 {
-                        let _ = state.db.remove_outbox(item.id).await;
+                    let message = error.to_string();
+                    tracing::warn!(
+                        %error,
+                        session_id = %item.session_id,
+                        attempts = item.attempts + 1,
+                        "outbox delivery failed"
+                    );
+                    if let Err(error) = state.db.increment_outbox_attempts(item.id, &message).await
+                    {
+                        tracing::warn!(%error, "failed to reschedule outbox item");
                     }
                 }
             }
@@ -166,7 +319,68 @@ pub async fn outbox_loop(state: AppState) {
     }
 }
 
+pub async fn notification_loop(state: AppState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        interval.tick().await;
+        if let Err(error) = state.notifier.retry_notifications(50).await {
+            tracing::warn!(%error, "failed to retry notifications");
+        }
+    }
+}
+
+pub async fn health_loop(state: AppState) {
+    let interval_secs = state.config.opencode.health_interval_secs.max(1);
+    let timeout_secs = state.config.opencode.health_timeout_secs.max(1);
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    let mut healthy: Option<bool> = None;
+
+    loop {
+        interval.tick().await;
+        let check =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), state.backend.health()).await;
+        let (now_healthy, detail) = match check {
+            Ok(Ok(())) => (true, None),
+            Ok(Err(error)) => (false, Some(error.to_string())),
+            Err(_) => (
+                false,
+                Some(format!("health check timed out after {timeout_secs}s")),
+            ),
+        };
+
+        if !now_healthy && let Some(detail) = &detail {
+            tracing::warn!(%detail, "opencode health check failed");
+        }
+        state.runtime.set_health(now_healthy, detail.as_deref());
+
+        let notify = match healthy {
+            None => !now_healthy,
+            Some(previous) => previous != now_healthy,
+        };
+        if notify {
+            send_health_notification(&state, now_healthy, detail.as_deref()).await;
+        }
+        healthy = Some(now_healthy);
+    }
+}
+
+async fn send_health_notification(state: &AppState, healthy: bool, detail: Option<&str>) {
+    let mut text = if healthy {
+        "opencode connection recovered.".to_string()
+    } else {
+        "opencode is unreachable.".to_string()
+    };
+    if let Some(detail) = detail {
+        text.push('\n');
+        text.push_str(detail);
+    }
+    if let Err(error) = state.notifier.notify_system(&text).await {
+        tracing::warn!(%error, "failed to send health notification");
+    }
+}
+
 async fn resync(state: &AppState) -> Result<()> {
+    state.runtime.inc_resync();
     let statuses = state.backend.session_statuses().await?;
     let sessions = state.backend.list_sessions().await?;
 
@@ -230,6 +444,10 @@ async fn handle_event(state: &AppState, event: AgentEvent) -> Result<()> {
         }
         AgentEvent::SessionDeleted(session_id) => {
             state.db.update_state(&session_id, "deleted").await?;
+            state
+                .db
+                .set_notification_pending(&session_id, false)
+                .await?;
         }
         AgentEvent::SessionStatus { session_id, status } => {
             let info = SessionInfo {
@@ -300,6 +518,7 @@ async fn handle_event(state: &AppState, event: AgentEvent) -> Result<()> {
 
 async fn notify_completion(state: &AppState, session_id: &str) -> Result<()> {
     if !state.config.notify.on_idle {
+        state.db.set_notification_pending(session_id, false).await?;
         return Ok(());
     }
 
@@ -308,10 +527,8 @@ async fn notify_completion(state: &AppState, session_id: &str) -> Result<()> {
         None => return Ok(()),
     };
 
-    if session.muted {
-        return Ok(());
-    }
-    if session.state == "error" {
+    if session.muted || session.state == "error" {
+        state.db.set_notification_pending(session_id, false).await?;
         return Ok(());
     }
 
@@ -323,9 +540,11 @@ async fn notify_completion(state: &AppState, session_id: &str) -> Result<()> {
     }
 
     if session.parent_id.is_some() && !state.config.notify.child_sessions {
+        state.db.set_notification_pending(session_id, false).await?;
         return Ok(());
     }
 
+    state.db.set_notification_pending(session_id, true).await?;
     state.db.update_state(session_id, "idle").await?;
     session.state = "idle".to_string();
 
@@ -334,10 +553,12 @@ async fn notify_completion(state: &AppState, session_id: &str) -> Result<()> {
         .messages(session_id, &session.directory, 10)
         .await?;
     let Some((message_id, text)) = render::extract_last_assistant_text(&messages) else {
+        state.db.set_notification_pending(session_id, false).await?;
         return Ok(());
     };
 
     if session.last_notified_message_id.as_deref() == Some(message_id.as_str()) {
+        state.db.set_notification_pending(session_id, false).await?;
         return Ok(());
     }
 
@@ -365,8 +586,9 @@ async fn notify_completion(state: &AppState, session_id: &str) -> Result<()> {
     };
     let (_, sent) = state
         .notifier
-        .notify_completion(&session, body, context.as_ref())
+        .notify_completion(&session, &message_id, body, context.as_ref())
         .await?;
+    state.db.set_notification_pending(session_id, false).await?;
     if !sent.is_empty() {
         state
             .db

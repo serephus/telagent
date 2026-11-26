@@ -28,6 +28,10 @@ let
       username = cfg.opencode.username;
       events_path = cfg.opencode.eventsPath;
       auto_discover = cfg.opencode.autoDiscover;
+      health_interval_secs = cfg.opencode.healthIntervalSecs;
+      health_timeout_secs = cfg.opencode.healthTimeoutSecs;
+      session_stale_secs = cfg.opencode.sessionStaleSecs;
+      event_idle_timeout_secs = cfg.opencode.eventIdleTimeoutSecs;
     }
     // lib.optionalAttrs (cfg.opencode.passwordFile != null) {
       password_file = cfg.opencode.passwordFile;
@@ -45,20 +49,18 @@ let
       child_sessions = cfg.notify.childSessions;
       include_last_message = cfg.notify.includeLastMessage;
       max_telegram_chars = cfg.notify.maxTelegramChars;
+    };
 
-      paste = {
-        enabled = cfg.notify.paste.enabled;
-        provider = cfg.notify.paste.provider;
-        url = cfg.notify.paste.url;
-        threshold_chars = cfg.notify.paste.thresholdChars;
-      }
-      // lib.optionalAttrs (cfg.notify.paste.tokenFile != null) {
-        token_file = cfg.notify.paste.tokenFile;
-      };
+    paste = {
+      enabled = cfg.paste.enabled;
+      url = cfg.paste.url;
+      threshold_chars = cfg.paste.thresholdChars;
+      max_bytes = cfg.paste.maxBytes;
     };
 
     security = {
       pairing_ttl_secs = cfg.security.pairingTtlSecs;
+      callback_ttl_secs = cfg.security.callbackTtlSecs;
       require_bind = cfg.security.requireBind;
     };
   }
@@ -161,6 +163,30 @@ in
         default = null;
         description = "Path to the opencode V2 service.json. Defaults to ~/.local/state/opencode/service.json.";
       };
+
+      healthIntervalSecs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 30;
+        description = "Seconds between opencode health checks.";
+      };
+
+      healthTimeoutSecs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 10;
+        description = "Timeout for each opencode health check.";
+      };
+
+      sessionStaleSecs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 900;
+        description = "Busy sessions with no updates for this long are reconciled against opencode.";
+      };
+
+      eventIdleTimeoutSecs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 120;
+        description = "Reconnect the opencode event stream after this many seconds without events.";
+      };
     };
 
     notify = {
@@ -203,37 +229,30 @@ in
         type = lib.types.ints.positive;
         default = 3900;
       };
+    };
 
-      paste = {
-        enabled = lib.mkOption {
-          type = lib.types.bool;
-          default = false;
-        };
+    paste = {
+      enabled = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Upload long notifications and /export pastes to cocoon as private pastes.";
+      };
 
-        provider = lib.mkOption {
-          type = lib.types.enum [
-            "none"
-            "paste-rs"
-            "zero-zero"
-            "custom"
-          ];
-          default = "none";
-        };
+      url = lib.mkOption {
+        type = lib.types.str;
+        default = "https://cocoon.sereph.us";
+        description = "Base URL of the cocoon pastebin service.";
+      };
 
-        url = lib.mkOption {
-          type = lib.types.str;
-          default = "";
-        };
+      thresholdChars = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 12000;
+      };
 
-        tokenFile = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-        };
-
-        thresholdChars = lib.mkOption {
-          type = lib.types.ints.positive;
-          default = 12000;
-        };
+      maxBytes = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 4194304;
+        description = "Maximum paste content size in bytes. Exports larger than this are split across multiple pastes.";
       };
     };
 
@@ -249,6 +268,12 @@ in
       pairingTtlSecs = lib.mkOption {
         type = lib.types.ints.positive;
         default = 600;
+      };
+
+      callbackTtlSecs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 3600;
+        description = "Maximum age of permission and question callbacks.";
       };
 
       requireBind = lib.mkOption {

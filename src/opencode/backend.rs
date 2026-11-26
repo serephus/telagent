@@ -17,6 +17,8 @@ pub type EventStream = Pin<Box<dyn Stream<Item = anyhow::Result<RawEvent>> + Sen
 pub trait OpenCodeBackend: Send + Sync {
     fn name(&self) -> &'static str;
 
+    async fn health(&self) -> anyhow::Result<()>;
+
     async fn list_sessions(&self) -> anyhow::Result<Vec<SessionInfo>>;
 
     async fn get_session(&self, session_id: &str) -> anyhow::Result<Option<SessionInfo>>;
@@ -38,6 +40,12 @@ pub trait OpenCodeBackend: Send + Sync {
         session_id: &str,
         directory: &str,
         limit: usize,
+    ) -> anyhow::Result<Vec<MessageWithParts>>;
+
+    async fn history(
+        &self,
+        session_id: &str,
+        directory: &str,
     ) -> anyhow::Result<Vec<MessageWithParts>>;
 
     async fn prompt_async(

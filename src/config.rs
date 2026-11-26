@@ -14,6 +14,7 @@ pub struct Config {
     pub telegram: TelegramConfig,
     pub opencode: OpenCodeConfig,
     pub notify: NotifyConfig,
+    pub paste: PasteConfig,
     pub storage: StorageConfig,
     pub security: SecurityConfig,
 }
@@ -38,6 +39,10 @@ pub struct OpenCodeConfig {
     pub auto_discover: bool,
     pub service_file: Option<PathBuf>,
     pub directory: Option<PathBuf>,
+    pub health_interval_secs: u64,
+    pub health_timeout_secs: u64,
+    pub session_stale_secs: u64,
+    pub event_idle_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -51,26 +56,15 @@ pub struct NotifyConfig {
     pub child_sessions: bool,
     pub include_last_message: bool,
     pub max_telegram_chars: usize,
-    pub paste: PasteConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PasteConfig {
     pub enabled: bool,
-    pub provider: PasteProvider,
     pub url: String,
-    pub token_file: Option<PathBuf>,
     pub threshold_chars: usize,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum PasteProvider {
-    None,
-    PasteRs,
-    ZeroZero,
-    Custom,
+    pub max_bytes: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -84,6 +78,7 @@ pub struct StorageConfig {
 #[serde(default)]
 pub struct SecurityConfig {
     pub pairing_ttl_secs: u64,
+    pub callback_ttl_secs: u64,
     pub require_bind: bool,
 }
 
@@ -98,6 +93,10 @@ impl Default for OpenCodeConfig {
             auto_discover: false,
             service_file: None,
             directory: None,
+            health_interval_secs: 30,
+            health_timeout_secs: 10,
+            session_stale_secs: 900,
+            event_idle_timeout_secs: 120,
         }
     }
 }
@@ -113,7 +112,6 @@ impl Default for NotifyConfig {
             child_sessions: false,
             include_last_message: true,
             max_telegram_chars: 3900,
-            paste: PasteConfig::default(),
         }
     }
 }
@@ -122,10 +120,9 @@ impl Default for PasteConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            provider: PasteProvider::None,
-            url: String::new(),
-            token_file: None,
+            url: "https://cocoon.sereph.us".to_string(),
             threshold_chars: 12_000,
+            max_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -134,6 +131,7 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             pairing_ttl_secs: 600,
+            callback_ttl_secs: 3600,
             require_bind: true,
         }
     }
@@ -225,7 +223,13 @@ mod tests {
     fn defaults_are_sane() {
         let config = Config::default();
         assert_eq!(config.opencode.url, "http://127.0.0.1:4096");
+        assert_eq!(config.opencode.health_interval_secs, 30);
+        assert_eq!(config.opencode.health_timeout_secs, 10);
+        assert_eq!(config.opencode.session_stale_secs, 900);
+        assert_eq!(config.opencode.event_idle_timeout_secs, 120);
+        assert_eq!(config.security.callback_ttl_secs, 3600);
         assert_eq!(config.notify.max_telegram_chars, 3900);
+        assert_eq!(config.paste.max_bytes, 4 * 1024 * 1024);
         assert!(config.security.require_bind);
     }
 
@@ -236,15 +240,15 @@ mod tests {
             [telegram]
             allowed_user_ids = [1, 2]
 
-            [notify.paste]
+            [paste]
             enabled = true
-            provider = "paste-rs"
+            url = "https://paste.example.com"
             "#,
         )
         .unwrap();
 
         assert_eq!(config.telegram.allowed_user_ids, vec![1, 2]);
-        assert!(config.notify.paste.enabled);
-        assert_eq!(config.notify.paste.provider, PasteProvider::PasteRs);
+        assert!(config.paste.enabled);
+        assert_eq!(config.paste.url, "https://paste.example.com");
     }
 }

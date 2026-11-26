@@ -116,9 +116,9 @@ homeManager = { pkgs, osConfig, ... }: {
       questions = true;
       includeLastMessage = true;
       childSessions = false;
-
-      paste.enabled = false;
     };
+
+    paste.enabled = false;
   };
 };
 ```
@@ -163,15 +163,38 @@ and interact with the bot. An empty list relies on the pairing code alone.
 /mute [ID]
 /unmute [ID]
 /abort [ID]
+/export [ID] [--title TITLE] [--reveal TIME]
+/retry [ID]
 /help
 ```
 
 Reply to any notification to send feedback to that session. If no reply target
-is set, the active session from `/use` is used.
+is set, the active session from `/use` is used. Feedback that cannot be delivered
+immediately is queued and retried with exponential backoff; `/retry [ID]`
+reschedules queued feedback for a session, and `/status` reports queue depth,
+backend health, event/retry counters, stale sessions, and the last delivery
+error.
 
 Commands such as `/compact`, `/mute`, and `/abort` also use the replied
 notification's session when sent as a reply. `/cancel` clears the active
 session selection; `/status` shows it with a `*` and reports pending requests.
+
+`/export` uploads the entire session history to the configured cocoon pastebin
+and replies with the URL(s). It uses the replied notification, an explicit
+session ID, or the active session. The paste title defaults to the session title
+and can be overridden with `--title`. The paste is revealed immediately by
+default; `--reveal` accepts a cocoon publish time such as `2030-01-01`,
+`2030-01-01 00:00`, or `2030-01-01T00:00:00Z` (UTC). Quote values that contain
+spaces:
+
+```text
+/export --title "Release notes" --reveal "2030-01-01 00:00"
+```
+
+If the rendered history exceeds `paste.max_bytes`, telagent splits it into
+multiple pastes, preferring user-message boundaries. Every part repeats the
+session title, ID, directory, and part number at the top. Individual messages
+larger than the limit are split at newline or character boundaries.
 
 `/new` creates a session and makes it active. Missing directories are created.
 Without a directory it uses the active session's directory, then
@@ -195,6 +218,25 @@ Notifications also include inline buttons:
 
 Completion notifications include the model and context usage when opencode
 reports it.
+
+Completion, error, permission, and question notifications are written to a
+durable per-chat outbox before they are sent. If Telegram or the proxy is
+unavailable, delivery is retried with exponential backoff instead of being
+dropped. Permission and question requests become answerable only after their
+message is delivered, and retries re-check opencode first so already-resolved
+requests are discarded. If fetching a completion result fails, the session is
+marked notification-pending and retried by the periodic reconciler. Notifications
+that exhaust all retry attempts are recorded as dead letters, and `/status` shows
+the most recent drops.
+
+telagent probes the opencode health endpoint every `opencode.health_interval_secs`
+seconds. A failed probe marks the backend unreachable and sends one Telegram
+notice; the next successful probe sends a recovery notice. Each check times out
+after `opencode.health_timeout_secs` seconds. Sessions stuck in `busy` or `retry`
+without updates for `opencode.session_stale_secs` are reconciled against the
+server so a missed idle event still produces a result notification. The event
+stream reconnects after `opencode.event_idle_timeout_secs` without events, which
+recovers half-open proxy connections.
 
 ## Permissions and questions
 
@@ -236,17 +278,19 @@ include_last_message = true
 max_telegram_chars = 3900
 child_sessions = false
 
-[notify.paste]
+[paste]
 enabled = false
-provider = "none" # none | paste-rs | zero-zero | custom
-url = ""
+url = "https://cocoon.sereph.us"
 threshold_chars = 12000
+max_bytes = 4194304
 ```
 
 Full messages are sent when they fit. Longer messages are split into numbered
 Telegram chunks. If paste upload is enabled and the message exceeds
-`threshold_chars`, telagent uploads it and sends the URL instead. Paste is
-opt-in because it sends code and possibly secrets to a third party.
+`threshold_chars`, telagent uploads it to [cocoon](https://github.com/serephus/cocoon)
+and sends the URL instead. `/export` also uses this pastebin. Pastes are marked
+private, so they are readable by URL but excluded from cocoon's public listing.
+Paste is opt-in because it sends code and possibly secrets to a third party.
 
 ## Security
 
@@ -254,6 +298,8 @@ opt-in because it sends code and possibly secrets to a third party.
 - If it listens beyond loopback, set `OPENCODE_SERVER_PASSWORD` and configure
   `opencode.passwordFile`.
 - Pairing codes are hashed and expire.
+- Permission and question callback buttons expire after
+  `security.callback_ttl_secs`.
 - Only bound chats can send feedback or approve permissions.
 - Permission approval from Telegram is security-sensitive; restrict
   `telegram.allowedUserIds`.

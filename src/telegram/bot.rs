@@ -355,6 +355,84 @@ async fn handle_command(
             if pending > 0 {
                 text.push_str(&format!("\nPending requests: {pending}"));
             }
+            let outbox = state.db.list_outbox(100).await?;
+            if !outbox.is_empty() {
+                let attempts = outbox.iter().map(|item| item.attempts).max().unwrap_or(0);
+                text.push_str(&format!(
+                    "\nOutbox: {} queued, max attempts {attempts}",
+                    outbox.len()
+                ));
+                if let Some(error) = outbox
+                    .iter()
+                    .rev()
+                    .find_map(|item| item.last_error.as_deref())
+                {
+                    text.push_str(&format!(
+                        "\nLast outbox error: {}",
+                        render::truncate(error, 300)
+                    ));
+                }
+            }
+            let dead = state.db.list_dead_notifications(5).await?;
+            if let Some(last) = dead.first() {
+                text.push_str(&format!("\nDropped notifications (recent): {}", dead.len()));
+                text.push_str(&format!(
+                    "\nLast drop: {} {} chat {} after {} attempts: {}",
+                    last.kind,
+                    last.session_id,
+                    last.chat_id,
+                    last.attempts,
+                    render::truncate(&last.reason, 200)
+                ));
+            }
+
+            let health = match state.runtime.backend_health() {
+                Some(true) => "healthy",
+                Some(false) => "unreachable",
+                None => "unknown",
+            };
+            text.push_str(&format!("\nBackend: {health}"));
+            let last_event = state
+                .runtime
+                .last_event_at()
+                .map(|at| format!("{}s ago", crate::state::now().saturating_sub(at)))
+                .unwrap_or_else(|| "never".to_string());
+            text.push_str(&format!("\nLast event: {last_event}"));
+            if let Some(error) = state.runtime.last_health_error() {
+                text.push_str(&format!(
+                    "\nLast health error: {}",
+                    render::truncate(&error, 200)
+                ));
+            }
+
+            let stale_before =
+                crate::state::now() - state.config.opencode.session_stale_secs.max(60) as i64;
+            let stale = state
+                .db
+                .stale_sessions(&state.instance_id, stale_before)
+                .await?;
+            if !stale.is_empty() {
+                text.push_str(&format!("\nStale sessions: {}", stale.len()));
+            }
+            let notifications = state.db.list_notifications(100).await?;
+            if !notifications.is_empty() {
+                let attempts = notifications
+                    .iter()
+                    .map(|item| item.attempts)
+                    .max()
+                    .unwrap_or(0);
+                text.push_str(&format!(
+                    "\nNotification retries: {} queued, max attempts {attempts}",
+                    notifications.len()
+                ));
+            }
+            text.push_str(&format!(
+                "\nMetrics: reconnects {}, resyncs {}, notification retries {}, drops {}",
+                state.runtime.event_reconnects(),
+                state.runtime.resyncs(),
+                state.runtime.notification_retries(),
+                state.runtime.notification_drops()
+            ));
             send(bot, chat_id, text).await?;
         }
         "use" => {
@@ -427,11 +505,158 @@ async fn handle_command(
                 }
             }
         }
+        "export" => {
+            export_history(bot, state, chat_id, parsed.raw_args, reply_session_id).await?;
+        }
+        "retry" => {
+            let Some(session_id) =
+                resolve_session_id(state, chat_id.0, args, reply_session_id).await?
+            else {
+                send(bot, chat_id, "No active session. Pass a session ID.").await?;
+                return Ok(());
+            };
+            let retried = state.db.retry_outbox(&session_id).await?;
+            if retried == 0 {
+                send(
+                    bot,
+                    chat_id,
+                    format!("No queued feedback for {session_id}."),
+                )
+                .await?;
+            } else {
+                send(
+                    bot,
+                    chat_id,
+                    format!("Rescheduled {retried} queued message(s) for {session_id}."),
+                )
+                .await?;
+            }
+        }
         other => {
             send(bot, chat_id, format!("Unknown command: /{other}")).await?;
         }
     }
 
+    Ok(())
+}
+
+async fn export_history(
+    bot: &Bot,
+    state: &AppState,
+    chat_id: ChatId,
+    raw_args: &str,
+    reply_session_id: Option<&str>,
+) -> Result<()> {
+    let options = match parse_export_args(raw_args) {
+        Ok(options) => options,
+        Err(error) => {
+            send(
+                bot,
+                chat_id,
+                format!("Usage: /export [ID] [--title TITLE] [--reveal TIME]\n{error}"),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let session_id = match options.session_id {
+        Some(session_id) => session_id,
+        None => match reply_session_id {
+            Some(session_id) => session_id.to_string(),
+            None => match state.db.active_session(chat_id.0).await? {
+                Some(session_id) => session_id,
+                None => {
+                    send(bot, chat_id, "No active session. Pass a session ID.").await?;
+                    return Ok(());
+                }
+            },
+        },
+    };
+
+    send(bot, chat_id, format!("Exporting {session_id} history...")).await?;
+
+    let directory = state.session_directory(&session_id).await?;
+    let session = state.get_or_placeholder_session(&session_id).await?;
+    let messages = match state.backend.history(&session_id, &directory).await {
+        Ok(messages) => messages,
+        Err(error) => {
+            send(bot, chat_id, format!("Export failed: {error}")).await?;
+            return Ok(());
+        }
+    };
+    if messages.is_empty() {
+        send(bot, chat_id, "No history to export.").await?;
+        return Ok(());
+    }
+
+    let pastes = render::history_pastes(&session, &messages, state.paste.max_bytes());
+    if pastes.is_empty() {
+        send(bot, chat_id, "No history to export.").await?;
+        return Ok(());
+    }
+
+    let title = options
+        .title
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| render::session_title(&session).to_string());
+    let title = render::truncate(title.trim(), 200);
+    let reveal = options
+        .reveal
+        .as_deref()
+        .filter(|reveal| !reveal.eq_ignore_ascii_case("now"));
+
+    let total = pastes.len();
+    let mut urls = Vec::new();
+    for (index, text) in pastes.iter().enumerate() {
+        let part_title = if total == 1 {
+            title.clone()
+        } else {
+            format!("{title} (part {}/{})", index + 1, total)
+        };
+        match state.paste.upload(text, &part_title, reveal).await {
+            Ok(url) => urls.push(url),
+            Err(error) => {
+                let mut message = format!(
+                    "Export failed after {} of {total} pastes: {error}",
+                    urls.len()
+                );
+                append_export_urls(&mut message, &urls);
+                send_export_message(bot, state, chat_id, &message).await?;
+                return Ok(());
+            }
+        }
+    }
+
+    let mut message = if urls.len() == 1 {
+        format!("Exported {session_id} history to {}", urls[0])
+    } else {
+        format!("Exported {session_id} history in {} parts:", urls.len())
+    };
+    append_export_urls(&mut message, &urls);
+    send_export_message(bot, state, chat_id, &message).await?;
+
+    Ok(())
+}
+
+fn append_export_urls(message: &mut String, urls: &[String]) {
+    if urls.is_empty() {
+        return;
+    }
+    for (index, url) in urls.iter().enumerate() {
+        message.push_str(&format!("\n{}. {url}", index + 1));
+    }
+}
+
+async fn send_export_message(
+    bot: &Bot,
+    state: &AppState,
+    chat_id: ChatId,
+    text: &str,
+) -> Result<()> {
+    for chunk in render::chunk_text(text, state.config.notify.max_telegram_chars) {
+        send(bot, chat_id, chunk).await?;
+    }
     Ok(())
 }
 
@@ -506,6 +731,11 @@ async fn handle_callback(bot: &Bot, state: &AppState, callback: &CallbackQuery) 
                 .await?;
                 return Ok(());
             }
+            if callback_expired(pending.created_at, state.config.security.callback_ttl_secs) {
+                let _ = state.forget_pending_request(request_id).await;
+                send(bot, ChatId(chat_id), "That request has expired.").await?;
+                return Ok(());
+            }
             match state
                 .backend
                 .reply_permission(
@@ -562,6 +792,11 @@ async fn handle_callback(bot: &Bot, state: &AppState, callback: &CallbackQuery) 
                     "This request belongs to another chat.",
                 )
                 .await?;
+                return Ok(());
+            }
+            if callback_expired(pending.created_at, state.config.security.callback_ttl_secs) {
+                let _ = state.forget_pending_request(request_id).await;
+                send(bot, ChatId(chat_id), "That question has expired.").await?;
                 return Ok(());
             }
             let Some(payload) = pending.payload else {
@@ -813,6 +1048,10 @@ fn callback_chat_id(callback: &CallbackQuery) -> i64 {
     }
 }
 
+fn callback_expired(created_at: i64, ttl_secs: u64) -> bool {
+    ttl_secs > 0 && crate::state::now().saturating_sub(created_at) > ttl_secs as i64
+}
+
 fn parse_command(text: &str) -> Option<ParsedCommand<'_>> {
     let rest = text.trim().strip_prefix('/')?;
     let (head, raw_args) = rest
@@ -825,6 +1064,78 @@ fn parse_command(text: &str) -> Option<ParsedCommand<'_>> {
         args: raw_args.split_whitespace().collect(),
         raw_args,
     })
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ExportArgs {
+    session_id: Option<String>,
+    title: Option<String>,
+    reveal: Option<String>,
+}
+
+fn parse_export_args(input: &str) -> std::result::Result<ExportArgs, String> {
+    let mut options = ExportArgs::default();
+    let mut tokens = split_args(input).into_iter();
+    while let Some(token) = tokens.next() {
+        match token.as_str() {
+            "--title" => match tokens.next() {
+                Some(value) => options.title = Some(value),
+                None => return Err("--title requires a value".to_string()),
+            },
+            "--reveal" => match tokens.next() {
+                Some(value) => options.reveal = Some(value),
+                None => return Err("--reveal requires a value".to_string()),
+            },
+            value if value.starts_with("--") => {
+                return Err(format!("unknown option {value}"));
+            }
+            value if options.session_id.is_none() => {
+                options.session_id = Some(value.to_string());
+            }
+            value => return Err(format!("unexpected argument {value}")),
+        }
+    }
+    Ok(options)
+}
+
+fn split_args(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut started = false;
+
+    for ch in input.chars() {
+        match quote {
+            Some(expected) => {
+                if ch == expected {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+                started = true;
+            }
+            None => match ch {
+                '"' | '\'' => {
+                    quote = Some(ch);
+                    started = true;
+                }
+                ch if ch.is_whitespace() => {
+                    if started {
+                        args.push(std::mem::take(&mut current));
+                        started = false;
+                    }
+                }
+                ch => {
+                    current.push(ch);
+                    started = true;
+                }
+            },
+        }
+    }
+    if started {
+        args.push(current);
+    }
+    args
 }
 
 fn parse_new_args(input: &str) -> (Option<String>, Option<String>) {
@@ -929,5 +1240,37 @@ mod tests {
                 Some("fix the build".to_string())
             )
         );
+    }
+
+    #[test]
+    fn parses_export_options() {
+        assert_eq!(
+            parse_export_args("ses_1 --title \"Release notes\" --reveal '2030-01-01 00:00'"),
+            Ok(ExportArgs {
+                session_id: Some("ses_1".to_string()),
+                title: Some("Release notes".to_string()),
+                reveal: Some("2030-01-01 00:00".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_export_options_without_values() {
+        assert_eq!(
+            parse_export_args("--title"),
+            Err("--title requires a value".to_string())
+        );
+        assert_eq!(
+            parse_export_args("--reveal"),
+            Err("--reveal requires a value".to_string())
+        );
+    }
+
+    #[test]
+    fn callback_expiry_uses_configured_ttl() {
+        let now = crate::state::now();
+        assert!(!callback_expired(now, 3600));
+        assert!(callback_expired(now - 3601, 3600));
+        assert!(!callback_expired(now - 10_000, 0));
     }
 }

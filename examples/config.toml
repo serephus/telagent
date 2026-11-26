@@ -17,6 +17,13 @@ events_path = "/global/event"
 # V2 only: read URL and auth from ~/.local/state/opencode/service.json.
 auto_discover = false
 # service_file = "/home/me/.local/state/opencode/service.json"
+# Health checks detect remote outages and send unreachable/recovered messages.
+health_interval_secs = 30
+health_timeout_secs = 10
+# Reconcile busy/retry sessions that have had no updates for this many seconds.
+session_stale_secs = 900
+# Force an event-stream reconnect after this many seconds without events.
+event_idle_timeout_secs = 120
 
 [notify]
 on_idle = true
@@ -28,12 +35,14 @@ child_sessions = false
 include_last_message = true
 max_telegram_chars = 3900
 
-[notify.paste]
+[paste]
+# Cocoon pastebin. Used for long notifications and /export.
+# Pastes are private: readable by URL but excluded from public listings.
 enabled = false
-provider = "none" # none | paste-rs | zero-zero | custom
-url = ""
-# token_file = "/run/secrets/paste-token"
+url = "https://cocoon.sereph.us"
 threshold_chars = 12000
+# Long exports are split into multiple private pastes above this many bytes.
+max_bytes = 4194304
 
 [storage]
 # Defaults to ~/.local/state/telagent/state.redb
@@ -41,4 +50,6 @@ threshold_chars = 12000
 
 [security]
 pairing_ttl_secs = 600
+# Permission/question callback buttons expire after this many seconds.
+callback_ttl_secs = 3600
 require_bind = true

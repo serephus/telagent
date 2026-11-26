@@ -4,8 +4,10 @@ use anyhow::Result;
 
 use crate::{
     config::Config,
+    metrics::RuntimeStatus,
     notifier::Notifier,
     opencode::{OpenCodeBackend, types::SessionInfo},
+    paste::PasteClient,
     state::{Db, SessionRecord},
 };
 
@@ -16,6 +18,8 @@ pub struct AppState {
     pub db: Db,
     pub backend: Arc<dyn OpenCodeBackend>,
     pub notifier: Notifier,
+    pub paste: PasteClient,
+    pub runtime: Arc<RuntimeStatus>,
 }
 
 impl AppState {
@@ -25,6 +29,8 @@ impl AppState {
         db: Db,
         backend: Arc<dyn OpenCodeBackend>,
         notifier: Notifier,
+        paste: PasteClient,
+        runtime: Arc<RuntimeStatus>,
     ) -> Self {
         Self {
             config,
@@ -32,6 +38,8 @@ impl AppState {
             db,
             backend,
             notifier,
+            paste,
+            runtime,
         }
     }
 
@@ -120,6 +128,10 @@ impl AppState {
             last_notified_message_id: existing
                 .as_ref()
                 .and_then(|s| s.last_notified_message_id.clone()),
+            notification_pending: existing
+                .as_ref()
+                .map(|s| s.notification_pending)
+                .unwrap_or(false),
             muted: existing.as_ref().map(|s| s.muted).unwrap_or(false),
             updated_at: existing.as_ref().map(|s| s.updated_at).unwrap_or(0),
         };
@@ -142,6 +154,7 @@ impl AppState {
             state: "idle".to_string(),
             last_assistant_message_id: None,
             last_notified_message_id: None,
+            notification_pending: false,
             muted: false,
             updated_at: 0,
         };

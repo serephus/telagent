@@ -130,6 +130,14 @@ impl OpenCodeBackend for V1Http {
         "opencode-v1-http"
     }
 
+    async fn health(&self) -> Result<()> {
+        let response = self
+            .request(reqwest::Method::GET, "/global/health")
+            .send()
+            .await?;
+        ensure_success(response).await
+    }
+
     async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
         self.get_json("/session", "").await
     }
@@ -235,6 +243,11 @@ impl OpenCodeBackend for V1Http {
             directory,
         )
         .await
+    }
+
+    async fn history(&self, session_id: &str, directory: &str) -> Result<Vec<MessageWithParts>> {
+        self.get_json(&format!("/session/{session_id}/message"), directory)
+            .await
     }
 
     async fn prompt_async(&self, session_id: &str, directory: &str, text: &str) -> Result<()> {
@@ -425,6 +438,10 @@ mod tests {
         });
 
         let router = Router::new()
+            .route(
+                "/global/health",
+                get(|| async { Json(json!({"healthy": true, "version": "test"})) }),
+            )
             .route(
                 "/global/event",
                 get(|| async {
@@ -735,6 +752,7 @@ mod tests {
         };
         let client = V1Http::new(&config).unwrap();
 
+        client.health().await.unwrap();
         let sessions = client.list_sessions().await.unwrap();
         assert_eq!(sessions[0].id, "ses_1");
         assert_eq!(sessions[0].title, "Test session");

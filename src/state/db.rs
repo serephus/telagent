@@ -17,6 +17,10 @@ const TELEGRAM_MESSAGES: TableDefinition<&str, &[u8]> = TableDefinition::new("te
 const PENDING: TableDefinition<&str, &[u8]> = TableDefinition::new("pending_requests");
 const PROCESSED: TableDefinition<i64, ()> = TableDefinition::new("processed_updates");
 const OUTBOX: TableDefinition<i64, &[u8]> = TableDefinition::new("outbox");
+const NOTIFICATION_OUTBOX: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("notification_outbox");
+const NOTIFICATION_DEAD: TableDefinition<i64, &[u8]> = TableDefinition::new("notification_dead");
+const MAX_DEAD_NOTIFICATIONS: usize = 20;
 
 const SEPARATOR: char = '\u{1f}';
 
@@ -36,6 +40,8 @@ pub struct SessionRecord {
     pub state: String,
     pub last_assistant_message_id: Option<String>,
     pub last_notified_message_id: Option<String>,
+    #[serde(default)]
+    pub notification_pending: bool,
     pub muted: bool,
     #[serde(default)]
     pub updated_at: i64,
@@ -61,6 +67,49 @@ pub struct OutboxItem {
     pub attempts: i64,
     #[serde(default)]
     pub next_attempt_at: i64,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationOutboxItem {
+    pub key: String,
+    pub chat_id: i64,
+    pub session_id: String,
+    pub message_id: String,
+    pub kind: String,
+    pub text: String,
+    #[serde(default)]
+    pub markup: Option<String>,
+    #[serde(default)]
+    pub payload: Option<String>,
+    pub attempts: i64,
+    #[serde(default)]
+    pub next_attempt_at: i64,
+    #[serde(default)]
+    pub created_at: i64,
+}
+
+pub struct NewNotification<'a> {
+    pub chat_id: i64,
+    pub session_id: &'a str,
+    pub message_id: &'a str,
+    pub kind: &'a str,
+    pub text: &'a str,
+    pub markup: Option<&'a str>,
+    pub payload: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadNotification {
+    pub chat_id: i64,
+    pub session_id: String,
+    pub message_id: String,
+    pub kind: String,
+    pub attempts: i64,
+    pub reason: String,
+    pub created_at: i64,
+    pub dropped_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -349,6 +398,35 @@ impl Db {
         .await
     }
 
+    pub async fn stale_sessions(
+        &self,
+        instance_id: &str,
+        before: i64,
+    ) -> Result<Vec<SessionRecord>> {
+        let instance_id = instance_id.to_string();
+        self.run(move |db| {
+            let read = db.begin_read()?;
+            let table = read.open_table(SESSIONS)?;
+            let prefix = format!("{instance_id}{SEPARATOR}");
+            let mut sessions = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                if !key.value().starts_with(&prefix) {
+                    continue;
+                }
+                let session: SessionRecord = decode(value.value())?;
+                if matches!(session.state.as_str(), "busy" | "retry")
+                    && session.updated_at <= before
+                {
+                    sessions.push(session);
+                }
+            }
+            sessions.sort_by_key(|session| session.updated_at);
+            Ok(sessions)
+        })
+        .await
+    }
+
     pub async fn update_state(&self, session_id: &str, state: &str) -> Result<()> {
         let session_id = session_id.to_string();
         let state = state.to_string();
@@ -396,6 +474,34 @@ impl Db {
             self::update_session(db, &session_id, |session| {
                 session.muted = muted;
             })
+        })
+        .await
+    }
+
+    pub async fn set_notification_pending(&self, session_id: &str, pending: bool) -> Result<()> {
+        let session_id = session_id.to_string();
+        self.run(move |db| {
+            self::update_session(db, &session_id, |session| {
+                session.notification_pending = pending;
+            })
+        })
+        .await
+    }
+
+    pub async fn pending_notification_sessions(&self) -> Result<Vec<SessionRecord>> {
+        self.run(move |db| {
+            let read = db.begin_read()?;
+            let table = read.open_table(SESSIONS)?;
+            let mut sessions = Vec::new();
+            for entry in table.iter()? {
+                let (_, value) = entry?;
+                let session: SessionRecord = decode(value.value())?;
+                if session.notification_pending {
+                    sessions.push(session);
+                }
+            }
+            sessions.sort_by_key(|session| session.updated_at);
+            Ok(sessions)
         })
         .await
     }
@@ -678,6 +784,7 @@ impl Db {
                     text,
                     attempts: 0,
                     next_attempt_at: 0,
+                    last_error: None,
                 };
                 let bytes = encode(&item)?;
                 table.insert(id, bytes.as_slice())?;
@@ -704,6 +811,26 @@ impl Db {
         .await
     }
 
+    pub async fn list_due_outbox(&self, limit: usize) -> Result<Vec<OutboxItem>> {
+        let now = now();
+        self.run(move |db| {
+            let read = db.begin_read()?;
+            let table = read.open_table(OUTBOX)?;
+            let mut items = Vec::new();
+            for entry in table.iter()? {
+                let (_, value) = entry?;
+                let item: OutboxItem = decode(value.value())?;
+                if item.next_attempt_at <= now {
+                    items.push(item);
+                }
+            }
+            items.sort_by_key(|item| item.id);
+            items.truncate(limit);
+            Ok(items)
+        })
+        .await
+    }
+
     pub async fn remove_outbox(&self, id: i64) -> Result<()> {
         self.run(move |db| {
             let write = db.begin_write()?;
@@ -717,7 +844,8 @@ impl Db {
         .await
     }
 
-    pub async fn increment_outbox_attempts(&self, id: i64) -> Result<()> {
+    pub async fn increment_outbox_attempts(&self, id: i64, error: &str) -> Result<()> {
+        let error = error.to_string();
         self.run(move |db| {
             let write = db.begin_write()?;
             {
@@ -730,6 +858,7 @@ impl Db {
                     item.attempts += 1;
                     let delay = (5 * 2_i64.pow(item.attempts.min(6) as u32)).min(300);
                     item.next_attempt_at = now() + delay;
+                    item.last_error = Some(error.clone());
                     let bytes = encode(&item)?;
                     table.insert(id, bytes.as_slice())?;
                 }
@@ -739,6 +868,274 @@ impl Db {
         })
         .await
     }
+
+    pub async fn retry_outbox(&self, session_id: &str) -> Result<usize> {
+        let session_id = session_id.to_string();
+        self.run(move |db| {
+            let write = db.begin_write()?;
+            let retried = {
+                let mut table = write.open_table(OUTBOX)?;
+                let ids = table
+                    .iter()?
+                    .filter_map(|entry| entry.ok().map(|(key, _)| key.value()))
+                    .collect::<Vec<_>>();
+                let mut retried = 0;
+                for id in ids {
+                    let item = table
+                        .get(id)?
+                        .map(|value| decode::<OutboxItem>(value.value()))
+                        .transpose()?;
+                    let Some(mut item) = item else {
+                        continue;
+                    };
+                    if item.session_id != session_id {
+                        continue;
+                    }
+                    item.attempts = 0;
+                    item.next_attempt_at = 0;
+                    item.last_error = None;
+                    let bytes = encode(&item)?;
+                    table.insert(id, bytes.as_slice())?;
+                    retried += 1;
+                }
+                retried
+            };
+            write.commit()?;
+            Ok(retried)
+        })
+        .await
+    }
+
+    pub async fn enqueue_notification(
+        &self,
+        notification: NewNotification<'_>,
+    ) -> Result<(String, bool)> {
+        let NewNotification {
+            chat_id,
+            session_id,
+            message_id,
+            kind,
+            text,
+            markup,
+            payload,
+        } = notification;
+        let key = notification_key(chat_id, session_id, message_id);
+        let item = NotificationOutboxItem {
+            key: key.clone(),
+            chat_id,
+            session_id: session_id.to_string(),
+            message_id: message_id.to_string(),
+            kind: kind.to_string(),
+            text: text.to_string(),
+            markup: markup.map(ToString::to_string),
+            payload: payload.map(ToString::to_string),
+            attempts: 0,
+            next_attempt_at: now() + 30,
+            created_at: now(),
+        };
+        let created = self
+            .run(move |db| {
+                let write = db.begin_write()?;
+                let created = {
+                    let mut table = write.open_table(NOTIFICATION_OUTBOX)?;
+                    if table.get(item.key.as_str())?.is_some() {
+                        false
+                    } else {
+                        let bytes = encode(&item)?;
+                        table.insert(item.key.as_str(), bytes.as_slice())?;
+                        true
+                    }
+                };
+                write.commit()?;
+                Ok(created)
+            })
+            .await?;
+        Ok((key, created))
+    }
+
+    pub async fn list_notifications(&self, limit: usize) -> Result<Vec<NotificationOutboxItem>> {
+        self.run(move |db| {
+            let read = db.begin_read()?;
+            let table = read.open_table(NOTIFICATION_OUTBOX)?;
+            let mut items = Vec::new();
+            for entry in table.iter()? {
+                let (_, value) = entry?;
+                items.push(decode::<NotificationOutboxItem>(value.value())?);
+            }
+            items.sort_by_key(|item| (item.next_attempt_at, item.created_at));
+            items.truncate(limit);
+            Ok(items)
+        })
+        .await
+    }
+
+    pub async fn remove_notification(&self, key: &str) -> Result<()> {
+        let key = key.to_string();
+        self.run(move |db| {
+            let write = db.begin_write()?;
+            {
+                let mut table = write.open_table(NOTIFICATION_OUTBOX)?;
+                table.remove(key.as_str())?;
+            }
+            write.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn remove_notifications_by_kind(&self, kind: &str) -> Result<()> {
+        let kind = kind.to_string();
+        self.run(move |db| {
+            let write = db.begin_write()?;
+            {
+                let mut table = write.open_table(NOTIFICATION_OUTBOX)?;
+                let keys = table
+                    .iter()?
+                    .filter_map(|entry| {
+                        entry
+                            .ok()
+                            .map(|(key, value)| (key.value().to_string(), value.value().to_vec()))
+                    })
+                    .filter(|(_, value)| {
+                        decode::<NotificationOutboxItem>(value)
+                            .map(|item| item.kind == kind)
+                            .unwrap_or(false)
+                    })
+                    .map(|(key, _)| key)
+                    .collect::<Vec<_>>();
+                for key in keys {
+                    table.remove(key.as_str())?;
+                }
+            }
+            write.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn increment_notification_attempts(&self, key: &str) -> Result<i64> {
+        let key = key.to_string();
+        self.run(move |db| {
+            let write = db.begin_write()?;
+            let attempts = {
+                let mut table = write.open_table(NOTIFICATION_OUTBOX)?;
+                let item = table
+                    .get(key.as_str())?
+                    .map(|value| decode::<NotificationOutboxItem>(value.value()))
+                    .transpose()?;
+                match item {
+                    Some(mut item) => {
+                        item.attempts += 1;
+                        let delay = (5 * 2_i64.pow(item.attempts.min(6) as u32)).min(300);
+                        item.next_attempt_at = now() + delay;
+                        let attempts = item.attempts;
+                        let bytes = encode(&item)?;
+                        table.insert(key.as_str(), bytes.as_slice())?;
+                        attempts
+                    }
+                    None => 0,
+                }
+            };
+            write.commit()?;
+            Ok(attempts)
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub async fn force_notification_due(&self, key: &str) -> Result<()> {
+        let key = key.to_string();
+        self.run(move |db| {
+            let write = db.begin_write()?;
+            {
+                let mut table = write.open_table(NOTIFICATION_OUTBOX)?;
+                let item = table
+                    .get(key.as_str())?
+                    .map(|value| decode::<NotificationOutboxItem>(value.value()))
+                    .transpose()?;
+                if let Some(mut item) = item {
+                    item.next_attempt_at = 0;
+                    let bytes = encode(&item)?;
+                    table.insert(key.as_str(), bytes.as_slice())?;
+                }
+            }
+            write.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn record_dead_notification(
+        &self,
+        item: &NotificationOutboxItem,
+        reason: &str,
+    ) -> Result<()> {
+        let record = DeadNotification {
+            chat_id: item.chat_id,
+            session_id: item.session_id.clone(),
+            message_id: item.message_id.clone(),
+            kind: item.kind.clone(),
+            attempts: item.attempts,
+            reason: reason.to_string(),
+            created_at: item.created_at,
+            dropped_at: now(),
+        };
+        self.run(move |db| {
+            let write = db.begin_write()?;
+            let id = {
+                let mut kv = write.open_table(KV)?;
+                let next = kv
+                    .get("notification_dead_seq")?
+                    .and_then(|value| {
+                        std::str::from_utf8(value.value())
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok())
+                    })
+                    .unwrap_or(0)
+                    + 1;
+                let next_bytes = next.to_string();
+                kv.insert("notification_dead_seq", next_bytes.as_bytes())?;
+                next as i64
+            };
+            {
+                let mut table = write.open_table(NOTIFICATION_DEAD)?;
+                let bytes = encode(&record)?;
+                table.insert(id, bytes.as_slice())?;
+                let mut keys = table
+                    .iter()?
+                    .filter_map(|entry| entry.ok().map(|(key, _)| key.value()))
+                    .collect::<Vec<_>>();
+                keys.sort_unstable();
+                let excess = keys.len().saturating_sub(MAX_DEAD_NOTIFICATIONS);
+                for key in keys.into_iter().take(excess) {
+                    table.remove(key)?;
+                }
+            }
+            write.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn list_dead_notifications(&self, limit: usize) -> Result<Vec<DeadNotification>> {
+        self.run(move |db| {
+            let read = db.begin_read()?;
+            let table = read.open_table(NOTIFICATION_DEAD)?;
+            let mut items = Vec::new();
+            for entry in table.iter()? {
+                let (_, value) = entry?;
+                items.push(decode::<DeadNotification>(value.value())?);
+            }
+            items.sort_by_key(|item| std::cmp::Reverse(item.dropped_at));
+            items.truncate(limit);
+            Ok(items)
+        })
+        .await
+    }
+}
+
+fn notification_key(chat_id: i64, session_id: &str, message_id: &str) -> String {
+    format!("{chat_id}{SEPARATOR}{session_id}{SEPARATOR}{message_id}")
 }
 
 fn initialize(db: &Database) -> Result<()> {
@@ -752,6 +1149,8 @@ fn initialize(db: &Database) -> Result<()> {
         let _ = write.open_table(PENDING)?;
         let _ = write.open_table(PROCESSED)?;
         let _ = write.open_table(OUTBOX)?;
+        let _ = write.open_table(NOTIFICATION_OUTBOX)?;
+        let _ = write.open_table(NOTIFICATION_DEAD)?;
     }
     write.commit()?;
     Ok(())
@@ -841,6 +1240,7 @@ mod tests {
             state: "busy".to_string(),
             last_assistant_message_id: None,
             last_notified_message_id: None,
+            notification_pending: false,
             muted: false,
             updated_at: 0,
         }
@@ -880,6 +1280,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finds_stale_busy_sessions() {
+        let (_dir, db) = temp_db().await;
+        db.upsert_session(&session("i", "ses_1")).await.unwrap();
+        let stale = db.stale_sessions("i", now() + 1).await.unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].session_id, "ses_1");
+
+        db.update_state("ses_1", "idle").await.unwrap();
+        assert!(db.stale_sessions("i", now() + 1).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn outbox_is_processed_in_order() {
         let (_dir, db) = temp_db().await;
         db.enqueue_outbox("ses_1", "one").await.unwrap();
@@ -888,12 +1300,146 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].text, "one");
         assert_eq!(items[1].text, "two");
-        db.increment_outbox_attempts(items[0].id).await.unwrap();
+        db.increment_outbox_attempts(items[0].id, "network down")
+            .await
+            .unwrap();
         let items = db.list_outbox(10).await.unwrap();
         assert_eq!(items[0].attempts, 1);
         assert!(items[0].next_attempt_at > now());
+        assert_eq!(items[0].last_error.as_deref(), Some("network down"));
+        assert_eq!(db.list_due_outbox(10).await.unwrap().len(), 1);
+
+        assert_eq!(db.retry_outbox("ses_1").await.unwrap(), 2);
+        let items = db.list_outbox(10).await.unwrap();
+        assert_eq!(items[0].attempts, 0);
+        assert!(items[0].last_error.is_none());
+        assert_eq!(db.list_due_outbox(10).await.unwrap().len(), 2);
+
         db.remove_outbox(items[0].id).await.unwrap();
         assert_eq!(db.list_outbox(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn notification_outbox_dedupes_and_reschedules() {
+        let (_dir, db) = temp_db().await;
+        let (key, created) = db
+            .enqueue_notification(NewNotification {
+                chat_id: 1,
+                session_id: "ses_1",
+                message_id: "msg_1",
+                kind: "completion",
+                text: "hello",
+                markup: Some("[]"),
+                payload: None,
+            })
+            .await
+            .unwrap();
+        assert!(created);
+        let (same_key, created) = db
+            .enqueue_notification(NewNotification {
+                chat_id: 1,
+                session_id: "ses_1",
+                message_id: "msg_1",
+                kind: "completion",
+                text: "hello",
+                markup: Some("[]"),
+                payload: None,
+            })
+            .await
+            .unwrap();
+        assert!(!created);
+        assert_eq!(key, same_key);
+
+        let items = db.list_notifications(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "hello");
+        assert_eq!(items[0].markup.as_deref(), Some("[]"));
+        assert_eq!(items[0].attempts, 0);
+
+        let attempts = db.increment_notification_attempts(&key).await.unwrap();
+        assert_eq!(attempts, 1);
+        let items = db.list_notifications(10).await.unwrap();
+        assert_eq!(items[0].attempts, 1);
+        assert!(items[0].next_attempt_at > now());
+
+        db.remove_notification(&key).await.unwrap();
+        assert!(db.list_notifications(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn removes_notifications_by_kind() {
+        let (_dir, db) = temp_db().await;
+        db.enqueue_notification(NewNotification {
+            chat_id: 1,
+            session_id: "",
+            message_id: "system:1",
+            kind: "system",
+            text: "offline",
+            markup: None,
+            payload: None,
+        })
+        .await
+        .unwrap();
+        db.enqueue_notification(NewNotification {
+            chat_id: 1,
+            session_id: "ses_1",
+            message_id: "msg_1",
+            kind: "completion",
+            text: "done",
+            markup: None,
+            payload: None,
+        })
+        .await
+        .unwrap();
+
+        db.remove_notifications_by_kind("system").await.unwrap();
+        let items = db.list_notifications(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "completion");
+    }
+
+    #[tokio::test]
+    async fn keeps_recent_dead_notifications() {
+        let (_dir, db) = temp_db().await;
+        let item = NotificationOutboxItem {
+            key: "key".to_string(),
+            chat_id: 1,
+            session_id: "ses_1".to_string(),
+            message_id: "msg_1".to_string(),
+            kind: "completion".to_string(),
+            text: "done".to_string(),
+            markup: None,
+            payload: None,
+            attempts: 50,
+            next_attempt_at: 0,
+            created_at: 0,
+        };
+        for index in 0..25 {
+            let mut item = item.clone();
+            item.message_id = format!("msg_{index}");
+            db.record_dead_notification(&item, "network down")
+                .await
+                .unwrap();
+        }
+
+        let dead = db.list_dead_notifications(100).await.unwrap();
+        assert_eq!(dead.len(), MAX_DEAD_NOTIFICATIONS);
+        assert_eq!(dead[0].reason, "network down");
+    }
+
+    #[tokio::test]
+    async fn tracks_pending_session_notifications() {
+        let (_dir, db) = temp_db().await;
+        db.upsert_session(&session("i", "ses_1")).await.unwrap();
+        assert!(db.pending_notification_sessions().await.unwrap().is_empty());
+
+        db.set_notification_pending("ses_1", true).await.unwrap();
+        let pending = db.pending_notification_sessions().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].session_id, "ses_1");
+
+        db.set_notification_pending("ses_1", false).await.unwrap();
+        assert!(db.pending_notification_sessions().await.unwrap().is_empty());
     }
 
     #[tokio::test]

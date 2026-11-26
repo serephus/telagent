@@ -78,6 +78,7 @@ pub struct StorageConfig {
 #[serde(default)]
 pub struct SecurityConfig {
     pub pairing_ttl_secs: u64,
+    pub callback_ttl_secs: u64,
     pub require_bind: bool,
 }
 
@@ -130,6 +131,7 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             pairing_ttl_secs: 600,
+            callback_ttl_secs: 3600,
             require_bind: true,
         }
     }
@@ -225,6 +227,7 @@ mod tests {
         assert_eq!(config.opencode.health_timeout_secs, 10);
         assert_eq!(config.opencode.session_stale_secs, 900);
         assert_eq!(config.opencode.event_idle_timeout_secs, 120);
+        assert_eq!(config.security.callback_ttl_secs, 3600);
         assert_eq!(config.notify.max_telegram_chars, 3900);
         assert_eq!(config.paste.max_bytes, 4 * 1024 * 1024);
         assert!(config.security.require_bind);

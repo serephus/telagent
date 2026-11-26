@@ -297,6 +297,8 @@ Paste is opt-in because it sends code and possibly secrets to a third party.
 - If it listens beyond loopback, set `OPENCODE_SERVER_PASSWORD` and configure
   `opencode.passwordFile`.
 - Pairing codes are hashed and expire.
+- Permission and question callback buttons expire after
+  `security.callback_ttl_secs`.
 - Only bound chats can send feedback or approve permissions.
 - Permission approval from Telegram is security-sensitive; restrict
   `telegram.allowedUserIds`.

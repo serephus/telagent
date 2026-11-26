@@ -60,6 +60,7 @@ let
 
     security = {
       pairing_ttl_secs = cfg.security.pairingTtlSecs;
+      callback_ttl_secs = cfg.security.callbackTtlSecs;
       require_bind = cfg.security.requireBind;
     };
   }
@@ -267,6 +268,12 @@ in
       pairingTtlSecs = lib.mkOption {
         type = lib.types.ints.positive;
         default = 600;
+      };
+
+      callbackTtlSecs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 3600;
+        description = "Maximum age of permission and question callbacks.";
       };
 
       requireBind = lib.mkOption {

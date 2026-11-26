@@ -50,4 +50,6 @@ max_bytes = 4194304
 
 [security]
 pairing_ttl_secs = 600
+# Permission/question callback buttons expire after this many seconds.
+callback_ttl_secs = 3600
 require_bind = true

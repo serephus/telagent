@@ -683,6 +683,11 @@ async fn handle_callback(bot: &Bot, state: &AppState, callback: &CallbackQuery) 
                 .await?;
                 return Ok(());
             }
+            if callback_expired(pending.created_at, state.config.security.callback_ttl_secs) {
+                let _ = state.forget_pending_request(request_id).await;
+                send(bot, ChatId(chat_id), "That request has expired.").await?;
+                return Ok(());
+            }
             match state
                 .backend
                 .reply_permission(
@@ -739,6 +744,11 @@ async fn handle_callback(bot: &Bot, state: &AppState, callback: &CallbackQuery) 
                     "This request belongs to another chat.",
                 )
                 .await?;
+                return Ok(());
+            }
+            if callback_expired(pending.created_at, state.config.security.callback_ttl_secs) {
+                let _ = state.forget_pending_request(request_id).await;
+                send(bot, ChatId(chat_id), "That question has expired.").await?;
                 return Ok(());
             }
             let Some(payload) = pending.payload else {
@@ -990,6 +1000,10 @@ fn callback_chat_id(callback: &CallbackQuery) -> i64 {
     }
 }
 
+fn callback_expired(created_at: i64, ttl_secs: u64) -> bool {
+    ttl_secs > 0 && crate::state::now().saturating_sub(created_at) > ttl_secs as i64
+}
+
 fn parse_command(text: &str) -> Option<ParsedCommand<'_>> {
     let rest = text.trim().strip_prefix('/')?;
     let (head, raw_args) = rest
@@ -1202,5 +1216,13 @@ mod tests {
             parse_export_args("--reveal"),
             Err("--reveal requires a value".to_string())
         );
+    }
+
+    #[test]
+    fn callback_expiry_uses_configured_ttl() {
+        let now = crate::state::now();
+        assert!(!callback_expired(now, 3600));
+        assert!(callback_expired(now - 3601, 3600));
+        assert!(!callback_expired(now - 10_000, 0));
     }
 }

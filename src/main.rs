@@ -8,6 +8,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 mod app;
 mod config;
 mod daemon;
+mod metrics;
 mod notifier;
 mod opencode;
 mod pairing;
@@ -87,6 +88,7 @@ async fn run_daemon(config: Config) -> Result<()> {
         tracing::warn!(%error, "failed to register Telegram commands");
     }
     let paste = PasteClient::new(&config.paste)?;
+    let runtime = Arc::new(metrics::RuntimeStatus::default());
     let notifier = Notifier::new(
         bot.clone(),
         config.clone(),
@@ -94,6 +96,7 @@ async fn run_daemon(config: Config) -> Result<()> {
         backend.clone(),
         paste.clone(),
         instance_id.clone(),
+        runtime.clone(),
     );
     let config = Arc::new(config);
     let state = Arc::new(AppState::new(
@@ -103,6 +106,7 @@ async fn run_daemon(config: Config) -> Result<()> {
         backend,
         notifier,
         paste,
+        runtime,
     ));
 
     let handler = dptree::entry().endpoint(telegram::bot::handle_update);

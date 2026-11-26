@@ -385,6 +385,54 @@ async fn handle_command(
                     render::truncate(&last.reason, 200)
                 ));
             }
+
+            let health = match state.runtime.backend_health() {
+                Some(true) => "healthy",
+                Some(false) => "unreachable",
+                None => "unknown",
+            };
+            text.push_str(&format!("\nBackend: {health}"));
+            let last_event = state
+                .runtime
+                .last_event_at()
+                .map(|at| format!("{}s ago", crate::state::now().saturating_sub(at)))
+                .unwrap_or_else(|| "never".to_string());
+            text.push_str(&format!("\nLast event: {last_event}"));
+            if let Some(error) = state.runtime.last_health_error() {
+                text.push_str(&format!(
+                    "\nLast health error: {}",
+                    render::truncate(&error, 200)
+                ));
+            }
+
+            let stale_before =
+                crate::state::now() - state.config.opencode.session_stale_secs.max(60) as i64;
+            let stale = state
+                .db
+                .stale_sessions(&state.instance_id, stale_before)
+                .await?;
+            if !stale.is_empty() {
+                text.push_str(&format!("\nStale sessions: {}", stale.len()));
+            }
+            let notifications = state.db.list_notifications(100).await?;
+            if !notifications.is_empty() {
+                let attempts = notifications
+                    .iter()
+                    .map(|item| item.attempts)
+                    .max()
+                    .unwrap_or(0);
+                text.push_str(&format!(
+                    "\nNotification retries: {} queued, max attempts {attempts}",
+                    notifications.len()
+                ));
+            }
+            text.push_str(&format!(
+                "\nMetrics: reconnects {}, resyncs {}, notification retries {}, drops {}",
+                state.runtime.event_reconnects(),
+                state.runtime.resyncs(),
+                state.runtime.notification_retries(),
+                state.runtime.notification_drops()
+            ));
             send(bot, chat_id, text).await?;
         }
         "use" => {

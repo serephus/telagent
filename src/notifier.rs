@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use teloxide::{
     Bot,
     payloads::SendMessageSetters,
@@ -10,6 +11,7 @@ use teloxide::{
 
 use crate::{
     config::Config,
+    metrics::RuntimeStatus,
     opencode::{
         OpenCodeBackend,
         types::{PermissionRequest, QuestionRequest, SessionContext},
@@ -21,14 +23,63 @@ use crate::{
 
 const MAX_NOTIFICATION_ATTEMPTS: i64 = 50;
 
+#[async_trait]
+trait TelegramTransport: Send + Sync {
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+        markup: Option<&NotificationMarkup>,
+    ) -> Result<i32>;
+
+    async fn delete_message(&self, chat_id: i64, message_id: i32) -> Result<()>;
+}
+
+struct BotTransport {
+    bot: Bot,
+}
+
+#[async_trait]
+impl TelegramTransport for BotTransport {
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+        markup: Option<&NotificationMarkup>,
+    ) -> Result<i32> {
+        let mut request = self
+            .bot
+            .send_message(ChatId(chat_id), text.to_string())
+            .link_preview_options(LinkPreviewOptions {
+                is_disabled: true,
+                url: None,
+                prefer_small_media: false,
+                prefer_large_media: false,
+                show_above_text: false,
+            });
+        if let Some(markup) = markup {
+            request = request.reply_markup(inline_markup(markup));
+        }
+        Ok(request.await?.id.0)
+    }
+
+    async fn delete_message(&self, chat_id: i64, message_id: i32) -> Result<()> {
+        self.bot
+            .delete_message(ChatId(chat_id), MessageId(message_id))
+            .await?;
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct Notifier {
-    bot: Bot,
+    transport: Arc<dyn TelegramTransport>,
     config: Config,
     db: Db,
     backend: Arc<dyn OpenCodeBackend>,
     paste: PasteClient,
     instance_id: String,
+    runtime: Arc<RuntimeStatus>,
 }
 
 impl Notifier {
@@ -39,14 +90,16 @@ impl Notifier {
         backend: Arc<dyn OpenCodeBackend>,
         paste: PasteClient,
         instance_id: String,
+        runtime: Arc<RuntimeStatus>,
     ) -> Self {
         Self {
-            bot,
+            transport: Arc::new(BotTransport { bot }),
             config,
             db,
             backend,
             paste,
             instance_id,
+            runtime,
         }
     }
 
@@ -90,6 +143,7 @@ impl Notifier {
                 continue;
             }
 
+            self.runtime.inc_notification_retry();
             if matches!(item.kind.as_str(), "permission" | "question") {
                 match self.request_still_pending(&item).await {
                     Ok(true) => {}
@@ -124,6 +178,7 @@ impl Notifier {
                             {
                                 tracing::warn!(%error, "failed to record dead notification");
                             }
+                            self.runtime.inc_notification_drop();
                             self.db.remove_notification(&item.key).await?;
                         }
                         continue;
@@ -179,6 +234,7 @@ impl Notifier {
                         if let Err(error) = self.db.record_dead_notification(&item, &reason).await {
                             tracing::warn!(%error, "failed to record dead notification");
                         }
+                        self.runtime.inc_notification_drop();
                         self.db.remove_notification(&item.key).await?;
                     }
                 }
@@ -294,11 +350,7 @@ impl Notifier {
         let (Some(chat_id), Some(message_id)) = (chat_id, message_id) else {
             return;
         };
-        if let Err(error) = self
-            .bot
-            .delete_message(ChatId(chat_id), MessageId(message_id))
-            .await
-        {
+        if let Err(error) = self.transport.delete_message(chat_id, message_id).await {
             tracing::warn!(chat_id, message_id, %error, "failed to delete telegram message");
         }
     }
@@ -463,24 +515,9 @@ impl Notifier {
         let mut sent = Vec::new();
 
         for (index, chunk) in chunks.iter().enumerate() {
-            let mut request = self
-                .bot
-                .send_message(ChatId(chat_id), chunk.clone())
-                .link_preview_options(LinkPreviewOptions {
-                    is_disabled: true,
-                    url: None,
-                    prefer_small_media: false,
-                    prefer_large_media: false,
-                    show_above_text: false,
-                });
-            if index == last_index
-                && let Some(markup) = markup
-            {
-                request = request.reply_markup(inline_markup(markup));
-            }
-            match request.await {
-                Ok(message) => {
-                    let message_id = message.id.0;
+            let markup = (index == last_index).then_some(markup).flatten();
+            match self.transport.send_message(chat_id, chunk, markup).await {
+                Ok(message_id) => {
                     sent.push((chat_id, message_id));
                     if !session_id.is_empty() {
                         let _ = self
@@ -489,7 +526,7 @@ impl Notifier {
                             .await;
                     }
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
         }
 
@@ -571,9 +608,126 @@ fn inline_markup(markup: &NotificationMarkup) -> InlineKeyboardMarkup {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Mutex},
+    };
+
+    use anyhow::anyhow;
+    use axum::{Json, Router, routing::get};
+    use serde_json::json;
 
     use super::*;
+    use crate::{
+        config::{Config, OpenCodeConfig, PasteConfig},
+        metrics::RuntimeStatus,
+        opencode::v1_http::V1Http,
+        state::{NewNotification, SessionRecord},
+    };
+
+    #[derive(Clone, Debug)]
+    struct SentMessage {
+        text: String,
+        markup: Option<NotificationMarkup>,
+    }
+
+    struct FakeState {
+        fail_next: bool,
+        sends: Vec<SentMessage>,
+        deleted: Vec<(i64, i32)>,
+    }
+
+    struct FakeTransport {
+        state: Mutex<FakeState>,
+    }
+
+    impl FakeTransport {
+        fn new(fail_next: bool) -> Self {
+            Self {
+                state: Mutex::new(FakeState {
+                    fail_next,
+                    sends: Vec::new(),
+                    deleted: Vec::new(),
+                }),
+            }
+        }
+
+        fn sends(&self) -> Vec<SentMessage> {
+            self.state.lock().unwrap().sends.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TelegramTransport for FakeTransport {
+        async fn send_message(
+            &self,
+            _chat_id: i64,
+            text: &str,
+            markup: Option<&NotificationMarkup>,
+        ) -> Result<i32> {
+            let mut state = self.state.lock().unwrap();
+            if state.fail_next {
+                state.fail_next = false;
+                return Err(anyhow!("network down"));
+            }
+            state.sends.push(SentMessage {
+                text: text.to_string(),
+                markup: markup.cloned(),
+            });
+            Ok(1000 + state.sends.len() as i32)
+        }
+
+        async fn delete_message(&self, chat_id: i64, message_id: i32) -> Result<()> {
+            self.state
+                .lock()
+                .unwrap()
+                .deleted
+                .push((chat_id, message_id));
+            Ok(())
+        }
+    }
+
+    async fn test_db() -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("state.redb")).unwrap();
+        db.bind("i", 1, 1).await.unwrap();
+        (dir, db)
+    }
+
+    fn v1_backend(url: String) -> Arc<dyn OpenCodeBackend> {
+        Arc::new(
+            V1Http::new(&OpenCodeConfig {
+                url,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+    }
+
+    fn notifier(
+        db: Db,
+        transport: Arc<FakeTransport>,
+        backend: Arc<dyn OpenCodeBackend>,
+    ) -> Notifier {
+        Notifier {
+            transport,
+            config: Config::default(),
+            db,
+            backend,
+            paste: PasteClient::new(&PasteConfig::default()).unwrap(),
+            instance_id: "i".to_string(),
+            runtime: Arc::new(RuntimeStatus::default()),
+        }
+    }
+
+    async fn spawn(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{address}")
+    }
 
     #[test]
     fn pending_request_check_handles_unknown_and_resolved_requests() {
@@ -586,5 +740,144 @@ mod tests {
             Some(HashSet::from(["req_2".to_string()])),
             "req_1"
         ));
+    }
+
+    #[tokio::test]
+    async fn retries_completion_and_restores_markup() {
+        let (_dir, db) = test_db().await;
+        let markup = serde_json::to_string(&completion_markup("ses_1")).unwrap();
+        let (key, _) = db
+            .enqueue_notification(NewNotification {
+                chat_id: 1,
+                session_id: "ses_1",
+                message_id: "msg_1",
+                kind: "completion",
+                text: "done",
+                markup: Some(&markup),
+                payload: None,
+            })
+            .await
+            .unwrap();
+        db.force_notification_due(&key).await.unwrap();
+
+        let transport = Arc::new(FakeTransport::new(true));
+        let notifier = notifier(
+            db.clone(),
+            transport.clone(),
+            v1_backend("http://127.0.0.1:1".to_string()),
+        );
+        notifier.retry_notifications(10).await.unwrap();
+        assert_eq!(db.list_notifications(10).await.unwrap().len(), 1);
+
+        db.force_notification_due(&key).await.unwrap();
+        notifier.retry_notifications(10).await.unwrap();
+        assert!(db.list_notifications(10).await.unwrap().is_empty());
+        let sends = transport.sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].text, "done");
+        assert_eq!(sends[0].markup, Some(completion_markup("ses_1")));
+    }
+
+    #[tokio::test]
+    async fn recreates_pending_request_and_drops_resolved_one() {
+        let router = Router::new().route(
+            "/permission",
+            get(|| async {
+                Json(json!([{
+                    "id": "per_1",
+                    "sessionID": "ses_1",
+                    "permission": "read"
+                }]))
+            }),
+        );
+        let backend = v1_backend(spawn(router).await);
+        let (_dir, db) = test_db().await;
+        db.upsert_session(&SessionRecord {
+            instance_id: "i".to_string(),
+            session_id: "ses_1".to_string(),
+            title: "Test".to_string(),
+            directory: "/tmp".to_string(),
+            project_id: None,
+            parent_id: None,
+            state: "idle".to_string(),
+            last_assistant_message_id: None,
+            last_notified_message_id: None,
+            notification_pending: false,
+            muted: false,
+            updated_at: 0,
+        })
+        .await
+        .unwrap();
+        let payload = serde_json::to_string(&PermissionRequest {
+            id: "per_1".to_string(),
+            session_id: "ses_1".to_string(),
+            permission: "read".to_string(),
+            patterns: Vec::new(),
+            metadata: serde_json::Value::Null,
+            always: Vec::new(),
+        })
+        .unwrap();
+        let markup = serde_json::to_string(&permission_markup("per_1")).unwrap();
+        let (key, _) = db
+            .enqueue_notification(NewNotification {
+                chat_id: 1,
+                session_id: "ses_1",
+                message_id: "per_1",
+                kind: "permission",
+                text: "permission",
+                markup: Some(&markup),
+                payload: Some(&payload),
+            })
+            .await
+            .unwrap();
+        db.force_notification_due(&key).await.unwrap();
+
+        let transport = Arc::new(FakeTransport::new(false));
+        let notifier = notifier(db.clone(), transport.clone(), backend);
+        notifier.retry_notifications(10).await.unwrap();
+        assert!(db.list_notifications(10).await.unwrap().is_empty());
+        assert!(
+            db.get_pending_request_for_chat("per_1", 1)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(transport.sends().len(), 1);
+
+        let (key, _) = db
+            .enqueue_notification(NewNotification {
+                chat_id: 1,
+                session_id: "ses_1",
+                message_id: "per_2",
+                kind: "permission",
+                text: "stale",
+                markup: None,
+                payload: Some(&payload),
+            })
+            .await
+            .unwrap();
+        db.force_notification_due(&key).await.unwrap();
+        notifier.retry_notifications(10).await.unwrap();
+        assert!(db.list_notifications(10).await.unwrap().is_empty());
+        assert_eq!(transport.sends().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn system_notice_uses_transport() {
+        let (_dir, db) = test_db().await;
+        let transport = Arc::new(FakeTransport::new(false));
+        let notifier = notifier(
+            db.clone(),
+            transport.clone(),
+            v1_backend("http://127.0.0.1:1".to_string()),
+        );
+        notifier
+            .notify_system("opencode is unreachable.")
+            .await
+            .unwrap();
+        assert!(db.list_notifications(10).await.unwrap().is_empty());
+        let sends = transport.sends();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].text, "opencode is unreachable.");
     }
 }

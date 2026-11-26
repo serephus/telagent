@@ -20,8 +20,10 @@ pub async fn event_loop(state: AppState) {
     let mut backoff = 1u64;
     loop {
         let mut idle_reconnect = false;
+        let mut connected = false;
         match state.backend.event_stream().await {
             Ok(mut stream) => {
+                connected = true;
                 backoff = 1;
                 if let Err(error) = resync(&state).await {
                     tracing::warn!(%error, "failed to resync opencode state");
@@ -30,6 +32,7 @@ pub async fn event_loop(state: AppState) {
                 loop {
                     match tokio::time::timeout(idle_timeout, stream.next()).await {
                         Ok(Some(Ok(raw))) => {
+                            state.runtime.mark_event();
                             let event = state.backend.normalize_event(raw);
                             if let Err(error) = handle_event(&state, event).await {
                                 tracing::warn!(%error, "failed to handle opencode event");
@@ -55,6 +58,9 @@ pub async fn event_loop(state: AppState) {
             }
         }
 
+        if connected {
+            state.runtime.inc_event_reconnect();
+        }
         if idle_reconnect {
             tracing::debug!(
                 backoff,
@@ -345,6 +351,7 @@ pub async fn health_loop(state: AppState) {
         if !now_healthy && let Some(detail) = &detail {
             tracing::warn!(%detail, "opencode health check failed");
         }
+        state.runtime.set_health(now_healthy, detail.as_deref());
 
         let notify = match healthy {
             None => !now_healthy,
@@ -373,6 +380,7 @@ async fn send_health_notification(state: &AppState, healthy: bool, detail: Optio
 }
 
 async fn resync(state: &AppState) -> Result<()> {
+    state.runtime.inc_resync();
     let statuses = state.backend.session_statuses().await?;
     let sessions = state.backend.list_sessions().await?;
 

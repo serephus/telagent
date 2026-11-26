@@ -1042,6 +1042,29 @@ impl Db {
         .await
     }
 
+    #[cfg(test)]
+    pub async fn force_notification_due(&self, key: &str) -> Result<()> {
+        let key = key.to_string();
+        self.run(move |db| {
+            let write = db.begin_write()?;
+            {
+                let mut table = write.open_table(NOTIFICATION_OUTBOX)?;
+                let item = table
+                    .get(key.as_str())?
+                    .map(|value| decode::<NotificationOutboxItem>(value.value()))
+                    .transpose()?;
+                if let Some(mut item) = item {
+                    item.next_attempt_at = 0;
+                    let bytes = encode(&item)?;
+                    table.insert(key.as_str(), bytes.as_slice())?;
+                }
+            }
+            write.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn record_dead_notification(
         &self,
         item: &NotificationOutboxItem,

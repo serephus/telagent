@@ -4,6 +4,7 @@ use anyhow::Result;
 
 use crate::{
     config::Config,
+    metrics::RuntimeStatus,
     notifier::Notifier,
     opencode::{OpenCodeBackend, types::SessionInfo},
     paste::PasteClient,
@@ -18,6 +19,7 @@ pub struct AppState {
     pub backend: Arc<dyn OpenCodeBackend>,
     pub notifier: Notifier,
     pub paste: PasteClient,
+    pub runtime: Arc<RuntimeStatus>,
 }
 
 impl AppState {
@@ -28,6 +30,7 @@ impl AppState {
         backend: Arc<dyn OpenCodeBackend>,
         notifier: Notifier,
         paste: PasteClient,
+        runtime: Arc<RuntimeStatus>,
     ) -> Self {
         Self {
             config,
@@ -36,6 +39,7 @@ impl AppState {
             backend,
             notifier,
             paste,
+            runtime,
         }
     }
 

@@ -171,8 +171,9 @@ and interact with the bot. An empty list relies on the pairing code alone.
 Reply to any notification to send feedback to that session. If no reply target
 is set, the active session from `/use` is used. Feedback that cannot be delivered
 immediately is queued and retried with exponential backoff; `/retry [ID]`
-reschedules queued feedback for a session, and `/status` reports queue depth and
-the last delivery error.
+reschedules queued feedback for a session, and `/status` reports queue depth,
+backend health, event/retry counters, stale sessions, and the last delivery
+error.
 
 Commands such as `/compact`, `/mute`, and `/abort` also use the replied
 notification's session when sent as a reply. `/cancel` clears the active

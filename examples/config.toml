@@ -20,6 +20,8 @@ auto_discover = false
 # Health checks detect remote outages and send unreachable/recovered messages.
 health_interval_secs = 30
 health_timeout_secs = 10
+# Reconcile busy/retry sessions that have had no updates for this many seconds.
+session_stale_secs = 900
 
 [notify]
 on_idle = true

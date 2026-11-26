@@ -384,6 +384,35 @@ impl Db {
         .await
     }
 
+    pub async fn stale_sessions(
+        &self,
+        instance_id: &str,
+        before: i64,
+    ) -> Result<Vec<SessionRecord>> {
+        let instance_id = instance_id.to_string();
+        self.run(move |db| {
+            let read = db.begin_read()?;
+            let table = read.open_table(SESSIONS)?;
+            let prefix = format!("{instance_id}{SEPARATOR}");
+            let mut sessions = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                if !key.value().starts_with(&prefix) {
+                    continue;
+                }
+                let session: SessionRecord = decode(value.value())?;
+                if matches!(session.state.as_str(), "busy" | "retry")
+                    && session.updated_at <= before
+                {
+                    sessions.push(session);
+                }
+            }
+            sessions.sort_by_key(|session| session.updated_at);
+            Ok(sessions)
+        })
+        .await
+    }
+
     pub async fn update_state(&self, session_id: &str, state: &str) -> Result<()> {
         let session_id = session_id.to_string();
         let state = state.to_string();
@@ -1142,6 +1171,18 @@ mod tests {
         let loaded = db.get_session("i", "ses_1").await.unwrap().unwrap();
         assert_eq!(loaded.state, "idle");
         assert!(loaded.muted);
+    }
+
+    #[tokio::test]
+    async fn finds_stale_busy_sessions() {
+        let (_dir, db) = temp_db().await;
+        db.upsert_session(&session("i", "ses_1")).await.unwrap();
+        let stale = db.stale_sessions("i", now() + 1).await.unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].session_id, "ses_1");
+
+        db.update_state("ses_1", "idle").await.unwrap();
+        assert!(db.stale_sessions("i", now() + 1).await.unwrap().is_empty());
     }
 
     #[tokio::test]

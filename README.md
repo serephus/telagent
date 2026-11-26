@@ -229,7 +229,9 @@ marked notification-pending and retried by the periodic reconciler.
 telagent probes the opencode health endpoint every `opencode.health_interval_secs`
 seconds. A failed probe marks the backend unreachable and sends one Telegram
 notice; the next successful probe sends a recovery notice. Each check times out
-after `opencode.health_timeout_secs` seconds.
+after `opencode.health_timeout_secs` seconds. Sessions stuck in `busy` or `retry`
+without updates for `opencode.session_stale_secs` are reconciled against the
+server so a missed idle event still produces a result notification.
 
 ## Permissions and questions
 

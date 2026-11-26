@@ -57,6 +57,9 @@ pub async fn reconcile_loop(state: AppState) {
         interval.tick().await;
         reconcile_pending_requests(&state).await;
         reconcile_pending_notifications(&state).await;
+        if let Err(error) = reconcile_stale_sessions(&state).await {
+            tracing::warn!(%error, "failed to reconcile stale sessions");
+        }
     }
 }
 
@@ -87,6 +90,77 @@ async fn reconcile_pending_notifications(state: &AppState) {
             );
         }
     }
+}
+
+async fn reconcile_stale_sessions(state: &AppState) -> Result<()> {
+    let stale_secs = state.config.opencode.session_stale_secs.max(60) as i64;
+    let before = crate::state::now() - stale_secs;
+    let stale = match state.db.stale_sessions(&state.instance_id, before).await {
+        Ok(stale) => stale,
+        Err(error) => {
+            tracing::warn!(%error, "failed to read stale sessions");
+            return Ok(());
+        }
+    };
+    if stale.is_empty() {
+        return Ok(());
+    }
+
+    tracing::info!(count = stale.len(), "reconciling stale sessions");
+    let statuses = match state.backend.session_statuses().await {
+        Ok(statuses) => statuses,
+        Err(error) => {
+            tracing::warn!(%error, "failed to refresh stale session statuses");
+            return Ok(());
+        }
+    };
+
+    for session in stale {
+        let info = match state.backend.get_session(&session.session_id).await {
+            Ok(Some(info)) => info,
+            Ok(None) => {
+                state
+                    .db
+                    .update_state(&session.session_id, "deleted")
+                    .await?;
+                state
+                    .db
+                    .set_notification_pending(&session.session_id, false)
+                    .await?;
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    session_id = %session.session_id,
+                    "failed to refresh stale session"
+                );
+                continue;
+            }
+        };
+        let previous = state
+            .db
+            .get_session(&state.instance_id, &session.session_id)
+            .await?
+            .map(|session| session.state)
+            .unwrap_or_default();
+        let new_state = statuses
+            .get(&info.id)
+            .map(SessionStatus::as_db_state)
+            .unwrap_or("idle");
+        let synced = state.sync_session(&info, new_state).await?;
+        if matches!(previous.as_str(), "busy" | "retry")
+            && new_state == "idle"
+            && let Err(error) = notify_completion(state, &synced.session_id).await
+        {
+            tracing::warn!(
+                %error,
+                session_id = %synced.session_id,
+                "failed to notify reconciled session"
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn reconcile_pending_requests(state: &AppState) {

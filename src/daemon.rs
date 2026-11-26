@@ -155,7 +155,7 @@ pub async fn outbox_loop(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_secs(5));
     loop {
         interval.tick().await;
-        let items = match state.db.list_outbox(20).await {
+        let items = match state.db.list_due_outbox(20).await {
             Ok(items) => items,
             Err(error) => {
                 tracing::warn!(%error, "failed to read outbox");
@@ -164,9 +164,28 @@ pub async fn outbox_loop(state: AppState) {
         };
 
         for item in items {
-            if item.next_attempt_at > crate::state::now() {
-                continue;
+            match state
+                .db
+                .get_session(&state.instance_id, &item.session_id)
+                .await
+            {
+                Ok(Some(session)) if session.state == "deleted" => {
+                    tracing::info!(session_id = %item.session_id, "dropping outbox item for deleted session");
+                    let _ = state.db.remove_outbox(item.id).await;
+                    continue;
+                }
+                Ok(None) => {
+                    tracing::info!(session_id = %item.session_id, "dropping outbox item for unknown session");
+                    let _ = state.db.remove_outbox(item.id).await;
+                    continue;
+                }
+                Ok(Some(_)) => {}
+                Err(error) => {
+                    tracing::warn!(%error, session_id = %item.session_id, "failed to read outbox session");
+                    continue;
+                }
             }
+
             let directory = match state.session_directory(&item.session_id).await {
                 Ok(directory) => directory,
                 Err(error) => {
@@ -185,10 +204,16 @@ pub async fn outbox_loop(state: AppState) {
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(%error, session_id = %item.session_id, "outbox delivery failed");
-                    let _ = state.db.increment_outbox_attempts(item.id).await;
-                    if item.attempts + 1 >= 5 {
-                        let _ = state.db.remove_outbox(item.id).await;
+                    let message = error.to_string();
+                    tracing::warn!(
+                        %error,
+                        session_id = %item.session_id,
+                        attempts = item.attempts + 1,
+                        "outbox delivery failed"
+                    );
+                    if let Err(error) = state.db.increment_outbox_attempts(item.id, &message).await
+                    {
+                        tracing::warn!(%error, "failed to reschedule outbox item");
                     }
                 }
             }

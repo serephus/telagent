@@ -65,6 +65,8 @@ pub struct OutboxItem {
     pub attempts: i64,
     #[serde(default)]
     pub next_attempt_at: i64,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -739,6 +741,7 @@ impl Db {
                     text,
                     attempts: 0,
                     next_attempt_at: 0,
+                    last_error: None,
                 };
                 let bytes = encode(&item)?;
                 table.insert(id, bytes.as_slice())?;
@@ -765,6 +768,26 @@ impl Db {
         .await
     }
 
+    pub async fn list_due_outbox(&self, limit: usize) -> Result<Vec<OutboxItem>> {
+        let now = now();
+        self.run(move |db| {
+            let read = db.begin_read()?;
+            let table = read.open_table(OUTBOX)?;
+            let mut items = Vec::new();
+            for entry in table.iter()? {
+                let (_, value) = entry?;
+                let item: OutboxItem = decode(value.value())?;
+                if item.next_attempt_at <= now {
+                    items.push(item);
+                }
+            }
+            items.sort_by_key(|item| item.id);
+            items.truncate(limit);
+            Ok(items)
+        })
+        .await
+    }
+
     pub async fn remove_outbox(&self, id: i64) -> Result<()> {
         self.run(move |db| {
             let write = db.begin_write()?;
@@ -778,7 +801,8 @@ impl Db {
         .await
     }
 
-    pub async fn increment_outbox_attempts(&self, id: i64) -> Result<()> {
+    pub async fn increment_outbox_attempts(&self, id: i64, error: &str) -> Result<()> {
+        let error = error.to_string();
         self.run(move |db| {
             let write = db.begin_write()?;
             {
@@ -791,12 +815,50 @@ impl Db {
                     item.attempts += 1;
                     let delay = (5 * 2_i64.pow(item.attempts.min(6) as u32)).min(300);
                     item.next_attempt_at = now() + delay;
+                    item.last_error = Some(error.clone());
                     let bytes = encode(&item)?;
                     table.insert(id, bytes.as_slice())?;
                 }
             }
             write.commit()?;
             Ok(())
+        })
+        .await
+    }
+
+    pub async fn retry_outbox(&self, session_id: &str) -> Result<usize> {
+        let session_id = session_id.to_string();
+        self.run(move |db| {
+            let write = db.begin_write()?;
+            let retried = {
+                let mut table = write.open_table(OUTBOX)?;
+                let ids = table
+                    .iter()?
+                    .filter_map(|entry| entry.ok().map(|(key, _)| key.value()))
+                    .collect::<Vec<_>>();
+                let mut retried = 0;
+                for id in ids {
+                    let item = table
+                        .get(id)?
+                        .map(|value| decode::<OutboxItem>(value.value()))
+                        .transpose()?;
+                    let Some(mut item) = item else {
+                        continue;
+                    };
+                    if item.session_id != session_id {
+                        continue;
+                    }
+                    item.attempts = 0;
+                    item.next_attempt_at = 0;
+                    item.last_error = None;
+                    let bytes = encode(&item)?;
+                    table.insert(id, bytes.as_slice())?;
+                    retried += 1;
+                }
+                retried
+            };
+            write.commit()?;
+            Ok(retried)
         })
         .await
     }
@@ -1091,10 +1153,21 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].text, "one");
         assert_eq!(items[1].text, "two");
-        db.increment_outbox_attempts(items[0].id).await.unwrap();
+        db.increment_outbox_attempts(items[0].id, "network down")
+            .await
+            .unwrap();
         let items = db.list_outbox(10).await.unwrap();
         assert_eq!(items[0].attempts, 1);
         assert!(items[0].next_attempt_at > now());
+        assert_eq!(items[0].last_error.as_deref(), Some("network down"));
+        assert_eq!(db.list_due_outbox(10).await.unwrap().len(), 1);
+
+        assert_eq!(db.retry_outbox("ses_1").await.unwrap(), 2);
+        let items = db.list_outbox(10).await.unwrap();
+        assert_eq!(items[0].attempts, 0);
+        assert!(items[0].last_error.is_none());
+        assert_eq!(db.list_due_outbox(10).await.unwrap().len(), 2);
+
         db.remove_outbox(items[0].id).await.unwrap();
         assert_eq!(db.list_outbox(10).await.unwrap().len(), 1);
     }

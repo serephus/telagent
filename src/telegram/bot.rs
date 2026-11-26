@@ -355,6 +355,24 @@ async fn handle_command(
             if pending > 0 {
                 text.push_str(&format!("\nPending requests: {pending}"));
             }
+            let outbox = state.db.list_outbox(100).await?;
+            if !outbox.is_empty() {
+                let attempts = outbox.iter().map(|item| item.attempts).max().unwrap_or(0);
+                text.push_str(&format!(
+                    "\nOutbox: {} queued, max attempts {attempts}",
+                    outbox.len()
+                ));
+                if let Some(error) = outbox
+                    .iter()
+                    .rev()
+                    .find_map(|item| item.last_error.as_deref())
+                {
+                    text.push_str(&format!(
+                        "\nLast outbox error: {}",
+                        render::truncate(error, 300)
+                    ));
+                }
+            }
             send(bot, chat_id, text).await?;
         }
         "use" => {
@@ -429,6 +447,30 @@ async fn handle_command(
         }
         "export" => {
             export_history(bot, state, chat_id, parsed.raw_args, reply_session_id).await?;
+        }
+        "retry" => {
+            let Some(session_id) =
+                resolve_session_id(state, chat_id.0, args, reply_session_id).await?
+            else {
+                send(bot, chat_id, "No active session. Pass a session ID.").await?;
+                return Ok(());
+            };
+            let retried = state.db.retry_outbox(&session_id).await?;
+            if retried == 0 {
+                send(
+                    bot,
+                    chat_id,
+                    format!("No queued feedback for {session_id}."),
+                )
+                .await?;
+            } else {
+                send(
+                    bot,
+                    chat_id,
+                    format!("Rescheduled {retried} queued message(s) for {session_id}."),
+                )
+                .await?;
+            }
         }
         other => {
             send(bot, chat_id, format!("Unknown command: /{other}")).await?;

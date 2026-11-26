@@ -79,6 +79,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Export session history to cocoon",
     },
     CommandSpec {
+        name: "retry",
+        usage: "[ID]",
+        description: "Retry queued feedback for a session",
+    },
+    CommandSpec {
         name: "help",
         usage: "",
         description: "Show available commands",

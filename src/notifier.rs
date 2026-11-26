@@ -157,7 +157,8 @@ impl Notifier {
 
         let mut text = text.to_string();
         if self.paste.should_paste(&text) {
-            match self.paste.upload(&text).await {
+            let title = format!("telagent {kind} {session_id}");
+            match self.paste.upload(&text, &title, None).await {
                 Ok(url) => {
                     text = format!("Full message is too long for Telegram:\n{url}");
                 }

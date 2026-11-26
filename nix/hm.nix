@@ -45,16 +45,12 @@ let
       child_sessions = cfg.notify.childSessions;
       include_last_message = cfg.notify.includeLastMessage;
       max_telegram_chars = cfg.notify.maxTelegramChars;
+    };
 
-      paste = {
-        enabled = cfg.notify.paste.enabled;
-        provider = cfg.notify.paste.provider;
-        url = cfg.notify.paste.url;
-        threshold_chars = cfg.notify.paste.thresholdChars;
-      }
-      // lib.optionalAttrs (cfg.notify.paste.tokenFile != null) {
-        token_file = cfg.notify.paste.tokenFile;
-      };
+    paste = {
+      enabled = cfg.paste.enabled;
+      url = cfg.paste.url;
+      threshold_chars = cfg.paste.thresholdChars;
     };
 
     security = {
@@ -203,37 +199,24 @@ in
         type = lib.types.ints.positive;
         default = 3900;
       };
+    };
 
-      paste = {
-        enabled = lib.mkOption {
-          type = lib.types.bool;
-          default = false;
-        };
+    paste = {
+      enabled = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Upload long notifications and /export pastes to cocoon.";
+      };
 
-        provider = lib.mkOption {
-          type = lib.types.enum [
-            "none"
-            "paste-rs"
-            "zero-zero"
-            "custom"
-          ];
-          default = "none";
-        };
+      url = lib.mkOption {
+        type = lib.types.str;
+        default = "https://cocoon.sereph.us";
+        description = "Base URL of the cocoon pastebin service.";
+      };
 
-        url = lib.mkOption {
-          type = lib.types.str;
-          default = "";
-        };
-
-        tokenFile = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-        };
-
-        thresholdChars = lib.mkOption {
-          type = lib.types.ints.positive;
-          default = 12000;
-        };
+      thresholdChars = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 12000;
       };
     };
 

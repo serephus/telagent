@@ -86,16 +86,23 @@ async fn run_daemon(config: Config) -> Result<()> {
     if let Err(error) = telegram::commands::register(&bot).await {
         tracing::warn!(%error, "failed to register Telegram commands");
     }
-    let paste = PasteClient::new(&config.notify.paste)?;
+    let paste = PasteClient::new(&config.paste)?;
     let notifier = Notifier::new(
         bot.clone(),
         config.clone(),
         db.clone(),
-        paste,
+        paste.clone(),
         instance_id.clone(),
     );
     let config = Arc::new(config);
-    let state = Arc::new(AppState::new(config, instance_id, db, backend, notifier));
+    let state = Arc::new(AppState::new(
+        config,
+        instance_id,
+        db,
+        backend,
+        notifier,
+        paste,
+    ));
 
     let handler = dptree::entry().endpoint(telegram::bot::handle_update);
     let mut dispatcher = Dispatcher::builder(bot.clone(), handler)

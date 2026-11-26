@@ -28,11 +28,10 @@ child_sessions = false
 include_last_message = true
 max_telegram_chars = 3900
 
-[notify.paste]
+[paste]
+# Cocoon pastebin. Used for long notifications and /export.
 enabled = false
-provider = "none" # none | paste-rs | zero-zero | custom
-url = ""
-# token_file = "/run/secrets/paste-token"
+url = "https://cocoon.sereph.us"
 threshold_chars = 12000
 
 [storage]

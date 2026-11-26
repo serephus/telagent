@@ -6,6 +6,7 @@ use crate::{
     config::Config,
     notifier::Notifier,
     opencode::{OpenCodeBackend, types::SessionInfo},
+    paste::PasteClient,
     state::{Db, SessionRecord},
 };
 
@@ -16,6 +17,7 @@ pub struct AppState {
     pub db: Db,
     pub backend: Arc<dyn OpenCodeBackend>,
     pub notifier: Notifier,
+    pub paste: PasteClient,
 }
 
 impl AppState {
@@ -25,6 +27,7 @@ impl AppState {
         db: Db,
         backend: Arc<dyn OpenCodeBackend>,
         notifier: Notifier,
+        paste: PasteClient,
     ) -> Self {
         Self {
             config,
@@ -32,6 +35,7 @@ impl AppState {
             db,
             backend,
             notifier,
+            paste,
         }
     }
 

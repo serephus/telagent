@@ -14,6 +14,7 @@ pub struct Config {
     pub telegram: TelegramConfig,
     pub opencode: OpenCodeConfig,
     pub notify: NotifyConfig,
+    pub paste: PasteConfig,
     pub storage: StorageConfig,
     pub security: SecurityConfig,
 }
@@ -51,26 +52,14 @@ pub struct NotifyConfig {
     pub child_sessions: bool,
     pub include_last_message: bool,
     pub max_telegram_chars: usize,
-    pub paste: PasteConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PasteConfig {
     pub enabled: bool,
-    pub provider: PasteProvider,
     pub url: String,
-    pub token_file: Option<PathBuf>,
     pub threshold_chars: usize,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum PasteProvider {
-    None,
-    PasteRs,
-    ZeroZero,
-    Custom,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -113,7 +102,6 @@ impl Default for NotifyConfig {
             child_sessions: false,
             include_last_message: true,
             max_telegram_chars: 3900,
-            paste: PasteConfig::default(),
         }
     }
 }
@@ -122,9 +110,7 @@ impl Default for PasteConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            provider: PasteProvider::None,
-            url: String::new(),
-            token_file: None,
+            url: "https://cocoon.sereph.us".to_string(),
             threshold_chars: 12_000,
         }
     }
@@ -236,15 +222,15 @@ mod tests {
             [telegram]
             allowed_user_ids = [1, 2]
 
-            [notify.paste]
+            [paste]
             enabled = true
-            provider = "paste-rs"
+            url = "https://paste.example.com"
             "#,
         )
         .unwrap();
 
         assert_eq!(config.telegram.allowed_user_ids, vec![1, 2]);
-        assert!(config.notify.paste.enabled);
-        assert_eq!(config.notify.paste.provider, PasteProvider::PasteRs);
+        assert!(config.paste.enabled);
+        assert_eq!(config.paste.url, "https://paste.example.com");
     }
 }

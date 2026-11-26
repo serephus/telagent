@@ -652,26 +652,13 @@ fn normalize_message(value: &Value) -> Option<MessageWithParts> {
         vec![Part {
             kind: "text".to_string(),
             text: Some(text.to_string()),
+            ..Default::default()
         }]
     } else {
         value
             .get("content")
             .and_then(Value::as_array)
-            .map(|content| {
-                content
-                    .iter()
-                    .filter_map(|part| {
-                        if part.get("type").and_then(Value::as_str) == Some("text") {
-                            Some(Part {
-                                kind: "text".to_string(),
-                                text: part.get("text").and_then(Value::as_str).map(str::to_string),
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
+            .map(|content| content.iter().filter_map(part_from_value).collect())
             .unwrap_or_default()
     };
 
@@ -684,6 +671,25 @@ fn normalize_message(value: &Value) -> Option<MessageWithParts> {
         },
         parts,
     })
+}
+
+fn part_from_value(value: &Value) -> Option<Part> {
+    match serde_json::from_value::<Part>(value.clone()) {
+        Ok(part) => Some(part),
+        Err(_) => {
+            let kind = value.get("type").and_then(Value::as_str)?.to_string();
+            let mut extra = match value {
+                Value::Object(map) => map.clone(),
+                _ => return None,
+            };
+            extra.remove("type");
+            Some(Part {
+                kind,
+                extra,
+                ..Default::default()
+            })
+        }
+    }
 }
 
 fn tokens_from_v2(value: &Value) -> MessageTokens {
@@ -1051,6 +1057,36 @@ mod tests {
         assert!(message.is_assistant());
         assert!(message.is_completed());
         assert_eq!(message.text(), "hello");
+        assert_eq!(message.parts.len(), 2);
+        assert_eq!(message.parts[1].kind, "reasoning");
+        assert_eq!(message.parts[1].text.as_deref(), Some("ignored"));
+    }
+
+    #[test]
+    fn normalizes_v2_tool_part_fields() {
+        let message = normalize_message(&json!({
+            "id": "msg_1",
+            "type": "assistant",
+            "content": [{
+                "type": "tool",
+                "tool": "bash",
+                "callID": "call_1",
+                "state": {
+                    "status": "completed",
+                    "input": {"command": "ls"},
+                    "output": "file.txt"
+                }
+            }]
+        }))
+        .unwrap();
+
+        let part = &message.parts[0];
+        assert_eq!(part.kind, "tool");
+        assert_eq!(part.tool.as_deref(), Some("bash"));
+        assert_eq!(part.call_id.as_deref(), Some("call_1"));
+        let state = part.state.as_ref().unwrap();
+        assert_eq!(state.status, "completed");
+        assert_eq!(state.output.as_deref(), Some("file.txt"));
     }
 
     #[test]

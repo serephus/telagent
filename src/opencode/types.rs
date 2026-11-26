@@ -117,12 +117,68 @@ pub struct MessageTime {
     pub completed: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Part {
     #[serde(rename = "type")]
     pub kind: String,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub ignored: bool,
+    #[serde(default)]
+    pub tool: Option<String>,
+    #[serde(rename = "callID", default)]
+    pub call_id: Option<String>,
+    #[serde(default)]
+    pub state: Option<ToolState>,
+    #[serde(default)]
+    pub mime: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub cost: Option<f64>,
+    #[serde(default)]
+    pub tokens: Option<MessageTokens>,
+    #[serde(default)]
+    pub hash: Option<String>,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub attempt: Option<u32>,
+    #[serde(default)]
+    pub error: Option<serde_json::Value>,
+    #[serde(default)]
+    pub auto: Option<bool>,
+    #[serde(default)]
+    pub overflow: Option<bool>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ToolState {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub input: serde_json::Value,
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 impl MessageWithParts {

@@ -75,11 +75,25 @@ pub struct NotificationOutboxItem {
     pub message_id: String,
     pub kind: String,
     pub text: String,
+    #[serde(default)]
+    pub markup: Option<String>,
+    #[serde(default)]
+    pub payload: Option<String>,
     pub attempts: i64,
     #[serde(default)]
     pub next_attempt_at: i64,
     #[serde(default)]
     pub created_at: i64,
+}
+
+pub struct NewNotification<'a> {
+    pub chat_id: i64,
+    pub session_id: &'a str,
+    pub message_id: &'a str,
+    pub kind: &'a str,
+    pub text: &'a str,
+    pub markup: Option<&'a str>,
+    pub payload: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -789,12 +803,17 @@ impl Db {
 
     pub async fn enqueue_notification(
         &self,
-        chat_id: i64,
-        session_id: &str,
-        message_id: &str,
-        kind: &str,
-        text: &str,
+        notification: NewNotification<'_>,
     ) -> Result<(String, bool)> {
+        let NewNotification {
+            chat_id,
+            session_id,
+            message_id,
+            kind,
+            text,
+            markup,
+            payload,
+        } = notification;
         let key = notification_key(chat_id, session_id, message_id);
         let item = NotificationOutboxItem {
             key: key.clone(),
@@ -803,6 +822,8 @@ impl Db {
             message_id: message_id.to_string(),
             kind: kind.to_string(),
             text: text.to_string(),
+            markup: markup.map(ToString::to_string),
+            payload: payload.map(ToString::to_string),
             attempts: 0,
             next_attempt_at: now() + 30,
             created_at: now(),
@@ -1052,12 +1073,28 @@ mod tests {
     async fn notification_outbox_dedupes_and_reschedules() {
         let (_dir, db) = temp_db().await;
         let (key, created) = db
-            .enqueue_notification(1, "ses_1", "msg_1", "completion", "hello")
+            .enqueue_notification(NewNotification {
+                chat_id: 1,
+                session_id: "ses_1",
+                message_id: "msg_1",
+                kind: "completion",
+                text: "hello",
+                markup: Some("[]"),
+                payload: None,
+            })
             .await
             .unwrap();
         assert!(created);
         let (same_key, created) = db
-            .enqueue_notification(1, "ses_1", "msg_1", "completion", "hello")
+            .enqueue_notification(NewNotification {
+                chat_id: 1,
+                session_id: "ses_1",
+                message_id: "msg_1",
+                kind: "completion",
+                text: "hello",
+                markup: Some("[]"),
+                payload: None,
+            })
             .await
             .unwrap();
         assert!(!created);
@@ -1066,6 +1103,7 @@ mod tests {
         let items = db.list_notifications(10).await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].text, "hello");
+        assert_eq!(items[0].markup.as_deref(), Some("[]"));
         assert_eq!(items[0].attempts, 0);
 
         let attempts = db.increment_notification_attempts(&key).await.unwrap();

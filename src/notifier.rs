@@ -11,7 +11,7 @@ use crate::{
     opencode::types::{PermissionRequest, QuestionRequest, SessionContext},
     paste::PasteClient,
     render,
-    state::{Db, SessionRecord},
+    state::{Db, NewNotification, SessionRecord},
 };
 
 const MAX_NOTIFICATION_ATTEMPTS: i64 = 50;
@@ -51,53 +51,16 @@ impl Notifier {
             )
             .await;
         let markup = completion_markup(&session.session_id);
-        let chats = self.db.bound_chats(&self.instance_id).await?;
-        let mut sent = Vec::new();
-
-        for chat_id in chats {
-            let (key, created) = self
-                .db
-                .enqueue_notification(
-                    chat_id,
-                    &session.session_id,
-                    message_id,
-                    "completion",
-                    &text,
-                )
-                .await?;
-            if !created {
-                continue;
-            }
-            match self
-                .send_chat_text(
-                    chat_id,
-                    &session.session_id,
-                    "completion",
-                    &text,
-                    Some(&markup),
-                )
-                .await
-            {
-                Ok(mut messages) => {
-                    sent.append(&mut messages);
-                    if let Err(error) = self.db.remove_notification(&key).await {
-                        tracing::warn!(%error, chat_id, "failed to clear notification");
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        chat_id,
-                        session_id = %session.session_id,
-                        %error,
-                        "completion notification queued for retry"
-                    );
-                    if let Err(error) = self.db.increment_notification_attempts(&key).await {
-                        tracing::warn!(%error, chat_id, "failed to reschedule notification");
-                    }
-                }
-            }
-        }
-
+        let sent = self
+            .notify_chats(
+                &session.session_id,
+                message_id,
+                "completion",
+                &text,
+                Some(markup),
+                None,
+            )
+            .await?;
         Ok((text, sent))
     }
 
@@ -113,10 +76,10 @@ impl Notifier {
                 continue;
             }
 
-            let markup = match item.kind.as_str() {
-                "completion" => Some(completion_markup(&item.session_id)),
-                _ => None,
-            };
+            let markup = item
+                .markup
+                .as_deref()
+                .and_then(|markup| serde_json::from_str::<NotificationMarkup>(markup).ok());
             match self
                 .send_chat_text(
                     item.chat_id,
@@ -127,15 +90,20 @@ impl Notifier {
                 )
                 .await
             {
-                Ok(_) => {
-                    let _ = self.db.remove_notification(&item.key).await;
+                Ok(messages) => {
                     if let Err(error) = self
-                        .db
-                        .set_last_notified_message(&item.session_id, &item.message_id)
+                        .record_delivery(
+                            &item.session_id,
+                            &item.message_id,
+                            &item.kind,
+                            item.payload.as_deref(),
+                            &messages,
+                        )
                         .await
                     {
                         tracing::warn!(%error, "failed to record retried notification");
                     }
+                    let _ = self.db.remove_notification(&item.key).await;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -165,10 +133,23 @@ impl Notifier {
         session: &SessionRecord,
         error: &str,
     ) -> Result<Vec<(i64, i32)>> {
-        let text = render::error_message(session, error);
-        let markup = completion_markup(&session.session_id);
-        self.deliver(&session.session_id, "error", &text, Some(markup))
-            .await
+        let text = self
+            .prepare_text(
+                &render::error_message(session, error),
+                "error",
+                &session.session_id,
+            )
+            .await;
+        let dedupe_id = unique_notification_id("error");
+        self.notify_chats(
+            &session.session_id,
+            &dedupe_id,
+            "error",
+            &text,
+            Some(completion_markup(&session.session_id)),
+            None,
+        )
+        .await
     }
 
     pub async fn notify_permission(
@@ -176,30 +157,23 @@ impl Notifier {
         session: &SessionRecord,
         request: &PermissionRequest,
     ) -> Result<Vec<(i64, i32)>> {
-        let text = render::permission_message(session, request);
-        let markup = InlineKeyboardMarkup::new(vec![vec![
-            InlineKeyboardButton::callback("Allow once", format!("p:o:{}", request.id)),
-            InlineKeyboardButton::callback("Always", format!("p:a:{}", request.id)),
-            InlineKeyboardButton::callback("Deny", format!("p:r:{}", request.id)),
-        ]]);
-        let sent = self
-            .deliver(&session.session_id, "permission", &text, Some(markup))
-            .await?;
-
+        let text = self
+            .prepare_text(
+                &render::permission_message(session, request),
+                "permission",
+                &session.session_id,
+            )
+            .await;
         let payload = serde_json::to_string(request)?;
-        for (chat_id, message_id) in &sent {
-            self.db
-                .add_pending_request(
-                    &request.id,
-                    "permission",
-                    &session.session_id,
-                    Some(*chat_id),
-                    Some(*message_id),
-                    Some(&payload),
-                )
-                .await?;
-        }
-        Ok(sent)
+        self.notify_chats(
+            &session.session_id,
+            &request.id,
+            "permission",
+            &text,
+            Some(permission_markup(&request.id)),
+            Some(payload),
+        )
+        .await
     }
 
     pub async fn notify_question(
@@ -207,26 +181,23 @@ impl Notifier {
         session: &SessionRecord,
         request: &QuestionRequest,
     ) -> Result<Vec<(i64, i32)>> {
-        let text = render::question_message(session, request);
-        let markup = question_markup(request);
-        let sent = self
-            .deliver(&session.session_id, "question", &text, markup)
-            .await?;
-
+        let text = self
+            .prepare_text(
+                &render::question_message(session, request),
+                "question",
+                &session.session_id,
+            )
+            .await;
         let payload = serde_json::to_string(request)?;
-        for (chat_id, message_id) in &sent {
-            self.db
-                .add_pending_request(
-                    &request.id,
-                    "question",
-                    &session.session_id,
-                    Some(*chat_id),
-                    Some(*message_id),
-                    Some(&payload),
-                )
-                .await?;
-        }
-        Ok(sent)
+        self.notify_chats(
+            &session.session_id,
+            &request.id,
+            "question",
+            &text,
+            question_markup(request),
+            Some(payload),
+        )
+        .await
     }
 
     pub async fn delete_telegram_message(&self, chat_id: Option<i64>, message_id: Option<i32>) {
@@ -243,22 +214,37 @@ impl Notifier {
     }
 
     pub async fn notify_created(&self, session: &SessionRecord) -> Result<Vec<(i64, i32)>> {
-        let text = format!(
-            "Session started\nTitle: {}\nDirectory: {}",
-            render::session_title(session),
-            session.directory
-        );
-        let markup = completion_markup(&session.session_id);
-        self.deliver(&session.session_id, "created", &text, Some(markup))
-            .await
+        let text = self
+            .prepare_text(
+                &format!(
+                    "Session started\nTitle: {}\nDirectory: {}",
+                    render::session_title(session),
+                    session.directory
+                ),
+                "created",
+                &session.session_id,
+            )
+            .await;
+        let dedupe_id = unique_notification_id("created");
+        self.notify_chats(
+            &session.session_id,
+            &dedupe_id,
+            "created",
+            &text,
+            Some(completion_markup(&session.session_id)),
+            None,
+        )
+        .await
     }
 
-    async fn deliver(
+    async fn notify_chats(
         &self,
         session_id: &str,
+        dedupe_id: &str,
         kind: &str,
         text: &str,
-        markup: Option<InlineKeyboardMarkup>,
+        markup: Option<NotificationMarkup>,
+        payload: Option<String>,
     ) -> Result<Vec<(i64, i32)>> {
         let mut sent = Vec::new();
         let chats = self.db.bound_chats(&self.instance_id).await?;
@@ -267,20 +253,87 @@ impl Notifier {
             return Ok(sent);
         }
 
-        let text = self.prepare_text(text, kind, session_id).await;
+        let markup_json = markup.as_ref().map(serde_json::to_string).transpose()?;
         for chat_id in chats {
+            let (key, created) = self
+                .db
+                .enqueue_notification(NewNotification {
+                    chat_id,
+                    session_id,
+                    message_id: dedupe_id,
+                    kind,
+                    text,
+                    markup: markup_json.as_deref(),
+                    payload: payload.as_deref(),
+                })
+                .await?;
+            if !created {
+                continue;
+            }
             match self
-                .send_chat_text(chat_id, session_id, kind, &text, markup.as_ref())
+                .send_chat_text(chat_id, session_id, kind, text, markup.as_ref())
                 .await
             {
-                Ok(mut messages) => sent.append(&mut messages),
+                Ok(mut messages) => {
+                    if let Err(error) = self
+                        .record_delivery(session_id, dedupe_id, kind, payload.as_deref(), &messages)
+                        .await
+                    {
+                        tracing::warn!(%error, chat_id, "failed to record delivery");
+                    }
+                    sent.append(&mut messages);
+                    if let Err(error) = self.db.remove_notification(&key).await {
+                        tracing::warn!(%error, chat_id, "failed to clear notification");
+                    }
+                }
                 Err(error) => {
-                    tracing::warn!(chat_id, %error, "failed to send telegram message");
+                    tracing::warn!(
+                        chat_id,
+                        session_id,
+                        %error,
+                        "notification queued for retry"
+                    );
+                    if let Err(error) = self.db.increment_notification_attempts(&key).await {
+                        tracing::warn!(%error, chat_id, "failed to reschedule notification");
+                    }
                 }
             }
         }
 
         Ok(sent)
+    }
+
+    async fn record_delivery(
+        &self,
+        session_id: &str,
+        dedupe_id: &str,
+        kind: &str,
+        payload: Option<&str>,
+        messages: &[(i64, i32)],
+    ) -> Result<()> {
+        match kind {
+            "completion" => {
+                self.db
+                    .set_last_notified_message(session_id, dedupe_id)
+                    .await?;
+            }
+            "permission" | "question" => {
+                for (chat_id, message_id) in messages {
+                    self.db
+                        .add_pending_request(
+                            dedupe_id,
+                            kind,
+                            session_id,
+                            Some(*chat_id),
+                            Some(*message_id),
+                            payload,
+                        )
+                        .await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     async fn prepare_text(&self, text: &str, kind: &str, session_id: &str) -> String {
@@ -305,7 +358,7 @@ impl Notifier {
         session_id: &str,
         kind: &str,
         text: &str,
-        markup: Option<&InlineKeyboardMarkup>,
+        markup: Option<&NotificationMarkup>,
     ) -> Result<Vec<(i64, i32)>> {
         let chunks = render::chunk_text(text, self.config.notify.max_telegram_chars);
         let last_index = chunks.len().saturating_sub(1);
@@ -325,7 +378,7 @@ impl Notifier {
             if index == last_index
                 && let Some(markup) = markup
             {
-                request = request.reply_markup(markup.clone());
+                request = request.reply_markup(inline_markup(markup));
             }
             match request.await {
                 Ok(message) => {
@@ -344,15 +397,29 @@ impl Notifier {
     }
 }
 
-fn completion_markup(session_id: &str) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![vec![
-        InlineKeyboardButton::callback("Reply", format!("r:{session_id}")),
-        InlineKeyboardButton::callback("Mute", format!("m:{session_id}")),
-        InlineKeyboardButton::callback("Sessions", "s".to_string()),
-    ]])
+fn unique_notification_id(kind: &str) -> String {
+    format!("{kind}:{}", uuid::Uuid::new_v4())
 }
 
-fn question_markup(request: &QuestionRequest) -> Option<InlineKeyboardMarkup> {
+type NotificationMarkup = Vec<Vec<(String, String)>>;
+
+fn completion_markup(session_id: &str) -> NotificationMarkup {
+    vec![vec![
+        ("Reply".to_string(), format!("r:{session_id}")),
+        ("Mute".to_string(), format!("m:{session_id}")),
+        ("Sessions".to_string(), "s".to_string()),
+    ]]
+}
+
+fn permission_markup(request_id: &str) -> NotificationMarkup {
+    vec![vec![
+        ("Allow once".to_string(), format!("p:o:{request_id}")),
+        ("Always".to_string(), format!("p:a:{request_id}")),
+        ("Deny".to_string(), format!("p:r:{request_id}")),
+    ]]
+}
+
+fn question_markup(request: &QuestionRequest) -> Option<NotificationMarkup> {
     if request.questions.len() != 1 {
         return None;
     }
@@ -364,7 +431,7 @@ fn question_markup(request: &QuestionRequest) -> Option<InlineKeyboardMarkup> {
     let mut rows = Vec::new();
     let mut current = Vec::new();
     for (index, option) in question.options.iter().enumerate() {
-        current.push(InlineKeyboardButton::callback(
+        current.push((
             render::truncate(&option.label, 40),
             format!("q:0:{index}:{}", request.id),
         ));
@@ -375,5 +442,20 @@ fn question_markup(request: &QuestionRequest) -> Option<InlineKeyboardMarkup> {
     if !current.is_empty() {
         rows.push(current);
     }
-    Some(InlineKeyboardMarkup::new(rows))
+    Some(rows)
+}
+
+fn inline_markup(markup: &NotificationMarkup) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(
+        markup
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|(text, callback_data)| {
+                        InlineKeyboardButton::callback(text.clone(), callback_data.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+    )
 }

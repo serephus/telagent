@@ -205,7 +205,7 @@ in
       enabled = lib.mkOption {
         type = lib.types.bool;
         default = false;
-        description = "Upload long notifications and /export pastes to cocoon.";
+        description = "Upload long notifications and /export pastes to cocoon as private pastes.";
       };
 
       url = lib.mkOption {

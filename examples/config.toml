@@ -30,6 +30,7 @@ max_telegram_chars = 3900
 
 [paste]
 # Cocoon pastebin. Used for long notifications and /export.
+# Pastes are private: readable by URL but excluded from public listings.
 enabled = false
 url = "https://cocoon.sereph.us"
 threshold_chars = 12000

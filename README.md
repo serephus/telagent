@@ -257,8 +257,9 @@ threshold_chars = 12000
 Full messages are sent when they fit. Longer messages are split into numbered
 Telegram chunks. If paste upload is enabled and the message exceeds
 `threshold_chars`, telagent uploads it to [cocoon](https://github.com/serephus/cocoon)
-and sends the URL instead. `/export` also uses this pastebin. Paste is opt-in
-because it sends code and possibly secrets to a third party.
+and sends the URL instead. `/export` also uses this pastebin. Pastes are marked
+private, so they are readable by URL but excluded from cocoon's public listing.
+Paste is opt-in because it sends code and possibly secrets to a third party.
 
 ## Security
 

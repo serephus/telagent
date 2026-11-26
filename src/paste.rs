@@ -48,6 +48,7 @@ impl PasteClient {
             title: &'a str,
             #[serde(skip_serializing_if = "Option::is_none")]
             publish_at: Option<&'a str>,
+            private: bool,
         }
 
         let response = self
@@ -57,6 +58,7 @@ impl PasteClient {
                 content: text,
                 title,
                 publish_at: publish_at.filter(|value| !value.trim().is_empty()),
+                private: true,
             })
             .send()
             .await?
@@ -128,5 +130,6 @@ mod tests {
         assert_eq!(body["content"], "history");
         assert_eq!(body["title"], "Session title");
         assert_eq!(body["publish_at"], "2030-01-01T00:00:00Z");
+        assert_eq!(body["private"], true);
     }
 }

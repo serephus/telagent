@@ -28,6 +28,10 @@ impl PasteClient {
         self.config.enabled && !self.config.url.trim().is_empty()
     }
 
+    pub fn max_bytes(&self) -> usize {
+        self.config.max_bytes
+    }
+
     pub async fn upload(
         &self,
         text: &str,
@@ -40,6 +44,13 @@ impl PasteClient {
         let url = self.config.url.trim();
         if url.is_empty() {
             bail!("paste.url is not configured");
+        }
+        if text.len() > self.config.max_bytes {
+            bail!(
+                "paste content is {} bytes, exceeding the cocoon limit of {} bytes",
+                text.len(),
+                self.config.max_bytes
+            );
         }
 
         #[derive(Serialize)]

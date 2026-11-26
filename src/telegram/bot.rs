@@ -488,30 +488,73 @@ async fn export_history(
         return Ok(());
     }
 
-    let text = render::history_message(&session, &messages);
+    let pastes = render::history_pastes(&session, &messages, state.paste.max_bytes());
+    if pastes.is_empty() {
+        send(bot, chat_id, "No history to export.").await?;
+        return Ok(());
+    }
+
     let title = options
         .title
         .filter(|title| !title.trim().is_empty())
         .unwrap_or_else(|| render::session_title(&session).to_string());
+    let title = render::truncate(title.trim(), 200);
     let reveal = options
         .reveal
         .as_deref()
         .filter(|reveal| !reveal.eq_ignore_ascii_case("now"));
 
-    match state.paste.upload(&text, &title, reveal).await {
-        Ok(url) => {
-            send(
-                bot,
-                chat_id,
-                format!("Exported {session_id} history to {url}"),
-            )
-            .await?;
-        }
-        Err(error) => {
-            send(bot, chat_id, format!("Export failed: {error}")).await?;
+    let total = pastes.len();
+    let mut urls = Vec::new();
+    for (index, text) in pastes.iter().enumerate() {
+        let part_title = if total == 1 {
+            title.clone()
+        } else {
+            format!("{title} (part {}/{})", index + 1, total)
+        };
+        match state.paste.upload(text, &part_title, reveal).await {
+            Ok(url) => urls.push(url),
+            Err(error) => {
+                let mut message = format!(
+                    "Export failed after {} of {total} pastes: {error}",
+                    urls.len()
+                );
+                append_export_urls(&mut message, &urls);
+                send_export_message(bot, state, chat_id, &message).await?;
+                return Ok(());
+            }
         }
     }
 
+    let mut message = if urls.len() == 1 {
+        format!("Exported {session_id} history to {}", urls[0])
+    } else {
+        format!("Exported {session_id} history in {} parts:", urls.len())
+    };
+    append_export_urls(&mut message, &urls);
+    send_export_message(bot, state, chat_id, &message).await?;
+
+    Ok(())
+}
+
+fn append_export_urls(message: &mut String, urls: &[String]) {
+    if urls.is_empty() {
+        return;
+    }
+    for (index, url) in urls.iter().enumerate() {
+        message.push_str(&format!("\n{}. {url}", index + 1));
+    }
+}
+
+async fn send_export_message(
+    bot: &Bot,
+    state: &AppState,
+    chat_id: ChatId,
+    text: &str,
+) -> Result<()> {
+    for chunk in render::chunk_text(text, state.config.notify.max_telegram_chars) {
+        send(bot, chat_id, chunk).await?;
+    }
     Ok(())
 }
 

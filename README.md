@@ -175,15 +175,21 @@ notification's session when sent as a reply. `/cancel` clears the active
 session selection; `/status` shows it with a `*` and reports pending requests.
 
 `/export` uploads the entire session history to the configured cocoon pastebin
-and replies with the URL. It uses the replied notification, an explicit session
-ID, or the active session. The paste title defaults to the session title and can
-be overridden with `--title`. The paste is revealed immediately by default;
-`--reveal` accepts a cocoon publish time such as `2030-01-01`, `2030-01-01 00:00`,
-or `2030-01-01T00:00:00Z` (UTC). Quote values that contain spaces:
+and replies with the URL(s). It uses the replied notification, an explicit
+session ID, or the active session. The paste title defaults to the session title
+and can be overridden with `--title`. The paste is revealed immediately by
+default; `--reveal` accepts a cocoon publish time such as `2030-01-01`,
+`2030-01-01 00:00`, or `2030-01-01T00:00:00Z` (UTC). Quote values that contain
+spaces:
 
 ```text
 /export --title "Release notes" --reveal "2030-01-01 00:00"
 ```
+
+If the rendered history exceeds `paste.max_bytes`, telagent splits it into
+multiple pastes, preferring user-message boundaries. Every part repeats the
+session title, ID, directory, and part number at the top. Individual messages
+larger than the limit are split at newline or character boundaries.
 
 `/new` creates a session and makes it active. Missing directories are created.
 Without a directory it uses the active session's directory, then
@@ -252,6 +258,7 @@ child_sessions = false
 enabled = false
 url = "https://cocoon.sereph.us"
 threshold_chars = 12000
+max_bytes = 4194304
 ```
 
 Full messages are sent when they fit. Longer messages are split into numbered

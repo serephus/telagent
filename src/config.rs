@@ -60,6 +60,7 @@ pub struct PasteConfig {
     pub enabled: bool,
     pub url: String,
     pub threshold_chars: usize,
+    pub max_bytes: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -112,6 +113,7 @@ impl Default for PasteConfig {
             enabled: false,
             url: "https://cocoon.sereph.us".to_string(),
             threshold_chars: 12_000,
+            max_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -212,6 +214,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.opencode.url, "http://127.0.0.1:4096");
         assert_eq!(config.notify.max_telegram_chars, 3900);
+        assert_eq!(config.paste.max_bytes, 4 * 1024 * 1024);
         assert!(config.security.require_bind);
     }
 

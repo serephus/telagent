@@ -51,6 +51,7 @@ let
       enabled = cfg.paste.enabled;
       url = cfg.paste.url;
       threshold_chars = cfg.paste.thresholdChars;
+      max_bytes = cfg.paste.maxBytes;
     };
 
     security = {
@@ -217,6 +218,12 @@ in
       thresholdChars = lib.mkOption {
         type = lib.types.ints.positive;
         default = 12000;
+      };
+
+      maxBytes = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 4194304;
+        description = "Maximum paste content size in bytes. Exports larger than this are split across multiple pastes.";
       };
     };
 

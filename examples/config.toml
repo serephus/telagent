@@ -34,6 +34,8 @@ max_telegram_chars = 3900
 enabled = false
 url = "https://cocoon.sereph.us"
 threshold_chars = 12000
+# Long exports are split into multiple private pastes above this many bytes.
+max_bytes = 4194304
 
 [storage]
 # Defaults to ~/.local/state/telagent/state.redb

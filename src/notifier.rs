@@ -14,6 +14,8 @@ use crate::{
     state::{Db, SessionRecord},
 };
 
+const MAX_NOTIFICATION_ATTEMPTS: i64 = 50;
+
 #[derive(Clone)]
 pub struct Notifier {
     bot: Bot,
@@ -37,15 +39,125 @@ impl Notifier {
     pub async fn notify_completion(
         &self,
         session: &SessionRecord,
+        message_id: &str,
         body: Option<&str>,
         context: Option<&SessionContext>,
     ) -> Result<(String, Vec<(i64, i32)>)> {
-        let text = render::completion_message(session, body, context);
+        let text = self
+            .prepare_text(
+                &render::completion_message(session, body, context),
+                "completion",
+                &session.session_id,
+            )
+            .await;
         let markup = completion_markup(&session.session_id);
-        let sent = self
-            .deliver(&session.session_id, "completion", &text, Some(markup))
-            .await?;
+        let chats = self.db.bound_chats(&self.instance_id).await?;
+        let mut sent = Vec::new();
+
+        for chat_id in chats {
+            let (key, created) = self
+                .db
+                .enqueue_notification(
+                    chat_id,
+                    &session.session_id,
+                    message_id,
+                    "completion",
+                    &text,
+                )
+                .await?;
+            if !created {
+                continue;
+            }
+            match self
+                .send_chat_text(
+                    chat_id,
+                    &session.session_id,
+                    "completion",
+                    &text,
+                    Some(&markup),
+                )
+                .await
+            {
+                Ok(mut messages) => {
+                    sent.append(&mut messages);
+                    if let Err(error) = self.db.remove_notification(&key).await {
+                        tracing::warn!(%error, chat_id, "failed to clear notification");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        chat_id,
+                        session_id = %session.session_id,
+                        %error,
+                        "completion notification queued for retry"
+                    );
+                    if let Err(error) = self.db.increment_notification_attempts(&key).await {
+                        tracing::warn!(%error, chat_id, "failed to reschedule notification");
+                    }
+                }
+            }
+        }
+
         Ok((text, sent))
+    }
+
+    pub async fn retry_notifications(&self, limit: usize) -> Result<()> {
+        let items = self.db.list_notifications(limit).await?;
+        let now = crate::state::now();
+        for item in items {
+            if item.next_attempt_at > now {
+                continue;
+            }
+            if !self.db.is_bound(item.chat_id).await? {
+                let _ = self.db.remove_notification(&item.key).await;
+                continue;
+            }
+
+            let markup = match item.kind.as_str() {
+                "completion" => Some(completion_markup(&item.session_id)),
+                _ => None,
+            };
+            match self
+                .send_chat_text(
+                    item.chat_id,
+                    &item.session_id,
+                    &item.kind,
+                    &item.text,
+                    markup.as_ref(),
+                )
+                .await
+            {
+                Ok(_) => {
+                    let _ = self.db.remove_notification(&item.key).await;
+                    if let Err(error) = self
+                        .db
+                        .set_last_notified_message(&item.session_id, &item.message_id)
+                        .await
+                    {
+                        tracing::warn!(%error, "failed to record retried notification");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        chat_id = item.chat_id,
+                        session_id = %item.session_id,
+                        attempts = item.attempts + 1,
+                        %error,
+                        "notification retry failed"
+                    );
+                    let attempts = self.db.increment_notification_attempts(&item.key).await?;
+                    if attempts >= MAX_NOTIFICATION_ATTEMPTS {
+                        tracing::warn!(
+                            chat_id = item.chat_id,
+                            session_id = %item.session_id,
+                            "dropping notification after repeated failures"
+                        );
+                        self.db.remove_notification(&item.key).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn notify_error(
@@ -155,6 +267,23 @@ impl Notifier {
             return Ok(sent);
         }
 
+        let text = self.prepare_text(text, kind, session_id).await;
+        for chat_id in chats {
+            match self
+                .send_chat_text(chat_id, session_id, kind, &text, markup.as_ref())
+                .await
+            {
+                Ok(mut messages) => sent.append(&mut messages),
+                Err(error) => {
+                    tracing::warn!(chat_id, %error, "failed to send telegram message");
+                }
+            }
+        }
+
+        Ok(sent)
+    }
+
+    async fn prepare_text(&self, text: &str, kind: &str, session_id: &str) -> String {
         let mut text = text.to_string();
         if self.paste.should_paste(&text) {
             let title = format!("telagent {kind} {session_id}");
@@ -167,40 +296,47 @@ impl Notifier {
                 }
             }
         }
+        text
+    }
 
-        let chunks = render::chunk_text(&text, self.config.notify.max_telegram_chars);
+    async fn send_chat_text(
+        &self,
+        chat_id: i64,
+        session_id: &str,
+        kind: &str,
+        text: &str,
+        markup: Option<&InlineKeyboardMarkup>,
+    ) -> Result<Vec<(i64, i32)>> {
+        let chunks = render::chunk_text(text, self.config.notify.max_telegram_chars);
         let last_index = chunks.len().saturating_sub(1);
+        let mut sent = Vec::new();
 
-        for chat_id in chats {
-            for (index, chunk) in chunks.iter().enumerate() {
-                let mut request = self
-                    .bot
-                    .send_message(ChatId(chat_id), chunk.clone())
-                    .link_preview_options(LinkPreviewOptions {
-                        is_disabled: true,
-                        url: None,
-                        prefer_small_media: false,
-                        prefer_large_media: false,
-                        show_above_text: false,
-                    });
-                if index == last_index
-                    && let Some(markup) = &markup
-                {
-                    request = request.reply_markup(markup.clone());
+        for (index, chunk) in chunks.iter().enumerate() {
+            let mut request = self
+                .bot
+                .send_message(ChatId(chat_id), chunk.clone())
+                .link_preview_options(LinkPreviewOptions {
+                    is_disabled: true,
+                    url: None,
+                    prefer_small_media: false,
+                    prefer_large_media: false,
+                    show_above_text: false,
+                });
+            if index == last_index
+                && let Some(markup) = markup
+            {
+                request = request.reply_markup(markup.clone());
+            }
+            match request.await {
+                Ok(message) => {
+                    let message_id = message.id.0;
+                    sent.push((chat_id, message_id));
+                    let _ = self
+                        .db
+                        .store_telegram_message(chat_id, message_id, session_id, kind)
+                        .await;
                 }
-                match request.await {
-                    Ok(message) => {
-                        let message_id = message.id.0;
-                        sent.push((chat_id, message_id));
-                        let _ = self
-                            .db
-                            .store_telegram_message(chat_id, message_id, session_id, kind)
-                            .await;
-                    }
-                    Err(error) => {
-                        tracing::warn!(chat_id, %error, "failed to send telegram message");
-                    }
-                }
+                Err(error) => return Err(error.into()),
             }
         }
 

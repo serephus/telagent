@@ -214,6 +214,12 @@ Notifications also include inline buttons:
 Completion notifications include the model and context usage when opencode
 reports it.
 
+Completion notifications are written to a durable per-chat outbox before they
+are sent. If Telegram or the proxy is unavailable, delivery is retried with
+exponential backoff instead of being dropped. If fetching the session result
+fails, the session is marked notification-pending and retried by the periodic
+reconciler.
+
 ## Permissions and questions
 
 `permission.asked` becomes a Telegram message with:

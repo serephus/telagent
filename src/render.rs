@@ -419,6 +419,7 @@ mod tests {
             state: "idle".to_string(),
             last_assistant_message_id: None,
             last_notified_message_id: None,
+            notification_pending: false,
             muted: false,
             updated_at: 0,
         };
@@ -444,6 +445,7 @@ mod tests {
             state: "idle".to_string(),
             last_assistant_message_id: None,
             last_notified_message_id: None,
+            notification_pending: false,
             muted: false,
             updated_at: 0,
         }

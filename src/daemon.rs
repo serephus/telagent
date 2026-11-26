@@ -56,6 +56,36 @@ pub async fn reconcile_loop(state: AppState) {
     loop {
         interval.tick().await;
         reconcile_pending_requests(&state).await;
+        reconcile_pending_notifications(&state).await;
+    }
+}
+
+async fn reconcile_pending_notifications(state: &AppState) {
+    let sessions = match state.db.pending_notification_sessions().await {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::warn!(%error, "failed to read pending notifications");
+            return;
+        }
+    };
+    for session in sessions {
+        if session.state == "busy" || session.state == "retry" {
+            continue;
+        }
+        if session.state == "deleted" {
+            let _ = state
+                .db
+                .set_notification_pending(&session.session_id, false)
+                .await;
+            continue;
+        }
+        if let Err(error) = notify_completion(state, &session.session_id).await {
+            tracing::warn!(
+                %error,
+                session_id = %session.session_id,
+                "failed to retry pending completion notification"
+            );
+        }
     }
 }
 
@@ -166,6 +196,16 @@ pub async fn outbox_loop(state: AppState) {
     }
 }
 
+pub async fn notification_loop(state: AppState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        interval.tick().await;
+        if let Err(error) = state.notifier.retry_notifications(50).await {
+            tracing::warn!(%error, "failed to retry notifications");
+        }
+    }
+}
+
 async fn resync(state: &AppState) -> Result<()> {
     let statuses = state.backend.session_statuses().await?;
     let sessions = state.backend.list_sessions().await?;
@@ -230,6 +270,10 @@ async fn handle_event(state: &AppState, event: AgentEvent) -> Result<()> {
         }
         AgentEvent::SessionDeleted(session_id) => {
             state.db.update_state(&session_id, "deleted").await?;
+            state
+                .db
+                .set_notification_pending(&session_id, false)
+                .await?;
         }
         AgentEvent::SessionStatus { session_id, status } => {
             let info = SessionInfo {
@@ -300,6 +344,7 @@ async fn handle_event(state: &AppState, event: AgentEvent) -> Result<()> {
 
 async fn notify_completion(state: &AppState, session_id: &str) -> Result<()> {
     if !state.config.notify.on_idle {
+        state.db.set_notification_pending(session_id, false).await?;
         return Ok(());
     }
 
@@ -308,10 +353,8 @@ async fn notify_completion(state: &AppState, session_id: &str) -> Result<()> {
         None => return Ok(()),
     };
 
-    if session.muted {
-        return Ok(());
-    }
-    if session.state == "error" {
+    if session.muted || session.state == "error" {
+        state.db.set_notification_pending(session_id, false).await?;
         return Ok(());
     }
 
@@ -323,9 +366,11 @@ async fn notify_completion(state: &AppState, session_id: &str) -> Result<()> {
     }
 
     if session.parent_id.is_some() && !state.config.notify.child_sessions {
+        state.db.set_notification_pending(session_id, false).await?;
         return Ok(());
     }
 
+    state.db.set_notification_pending(session_id, true).await?;
     state.db.update_state(session_id, "idle").await?;
     session.state = "idle".to_string();
 
@@ -334,10 +379,12 @@ async fn notify_completion(state: &AppState, session_id: &str) -> Result<()> {
         .messages(session_id, &session.directory, 10)
         .await?;
     let Some((message_id, text)) = render::extract_last_assistant_text(&messages) else {
+        state.db.set_notification_pending(session_id, false).await?;
         return Ok(());
     };
 
     if session.last_notified_message_id.as_deref() == Some(message_id.as_str()) {
+        state.db.set_notification_pending(session_id, false).await?;
         return Ok(());
     }
 
@@ -365,8 +412,9 @@ async fn notify_completion(state: &AppState, session_id: &str) -> Result<()> {
     };
     let (_, sent) = state
         .notifier
-        .notify_completion(&session, body, context.as_ref())
+        .notify_completion(&session, &message_id, body, context.as_ref())
         .await?;
+    state.db.set_notification_pending(session_id, false).await?;
     if !sent.is_empty() {
         state
             .db

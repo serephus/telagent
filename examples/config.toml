@@ -17,6 +17,9 @@ events_path = "/global/event"
 # V2 only: read URL and auth from ~/.local/state/opencode/service.json.
 auto_discover = false
 # service_file = "/home/me/.local/state/opencode/service.json"
+# Health checks detect remote outages and send unreachable/recovered messages.
+health_interval_secs = 30
+health_timeout_secs = 10
 
 [notify]
 on_idle = true

@@ -237,6 +237,14 @@ impl OpenCodeBackend for V2Http {
         "opencode-v2-http"
     }
 
+    async fn health(&self) -> Result<()> {
+        let response = self
+            .request(reqwest::Method::GET, "/api/health")
+            .send()
+            .await?;
+        ensure_success(response).await
+    }
+
     async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
         let response: SessionsResponse = self.get_json("/api/session?limit=50&order=desc").await?;
         Ok(response
@@ -1185,6 +1193,10 @@ mod integration_tests {
                 }),
             )
             .route(
+                "/api/health",
+                get(|| async { Json(json!({"healthy": true, "version": "test", "pid": 1})) }),
+            )
+            .route(
                 "/api/session/active",
                 get(|| async { Json(json!({"data": {"ses_1": {"type": "running"}}})) }),
             )
@@ -1289,6 +1301,7 @@ mod integration_tests {
         };
         let client = V2Http::new(&config).unwrap();
 
+        client.health().await.unwrap();
         let sessions = client.list_sessions().await.unwrap();
         assert_eq!(sessions[0].id, "ses_1");
         assert_eq!(sessions[0].title, "Test session");

@@ -222,6 +222,11 @@ message is delivered, and retries re-check opencode first so already-resolved
 requests are discarded. If fetching a completion result fails, the session is
 marked notification-pending and retried by the periodic reconciler.
 
+telagent probes the opencode health endpoint every `opencode.health_interval_secs`
+seconds. A failed probe marks the backend unreachable and sends one Telegram
+notice; the next successful probe sends a recovery notice. Each check times out
+after `opencode.health_timeout_secs` seconds.
+
 ## Permissions and questions
 
 `permission.asked` becomes a Telegram message with:

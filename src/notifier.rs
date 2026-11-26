@@ -311,6 +311,14 @@ impl Notifier {
         .await
     }
 
+    pub async fn notify_system(&self, text: &str) -> Result<()> {
+        self.db.remove_notifications_by_kind("system").await?;
+        let dedupe_id = unique_notification_id("system");
+        self.notify_chats("", &dedupe_id, "system", text, None, None)
+            .await?;
+        Ok(())
+    }
+
     async fn notify_chats(
         &self,
         session_id: &str,
@@ -458,10 +466,12 @@ impl Notifier {
                 Ok(message) => {
                     let message_id = message.id.0;
                     sent.push((chat_id, message_id));
-                    let _ = self
-                        .db
-                        .store_telegram_message(chat_id, message_id, session_id, kind)
-                        .await;
+                    if !session_id.is_empty() {
+                        let _ = self
+                            .db
+                            .store_telegram_message(chat_id, message_id, session_id, kind)
+                            .await;
+                    }
                 }
                 Err(error) => return Err(error.into()),
             }

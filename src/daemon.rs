@@ -206,6 +206,55 @@ pub async fn notification_loop(state: AppState) {
     }
 }
 
+pub async fn health_loop(state: AppState) {
+    let interval_secs = state.config.opencode.health_interval_secs.max(1);
+    let timeout_secs = state.config.opencode.health_timeout_secs.max(1);
+    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+    let mut healthy: Option<bool> = None;
+
+    loop {
+        interval.tick().await;
+        let check =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), state.backend.health()).await;
+        let (now_healthy, detail) = match check {
+            Ok(Ok(())) => (true, None),
+            Ok(Err(error)) => (false, Some(error.to_string())),
+            Err(_) => (
+                false,
+                Some(format!("health check timed out after {timeout_secs}s")),
+            ),
+        };
+
+        if !now_healthy && let Some(detail) = &detail {
+            tracing::warn!(%detail, "opencode health check failed");
+        }
+
+        let notify = match healthy {
+            None => !now_healthy,
+            Some(previous) => previous != now_healthy,
+        };
+        if notify {
+            send_health_notification(&state, now_healthy, detail.as_deref()).await;
+        }
+        healthy = Some(now_healthy);
+    }
+}
+
+async fn send_health_notification(state: &AppState, healthy: bool, detail: Option<&str>) {
+    let mut text = if healthy {
+        "opencode connection recovered.".to_string()
+    } else {
+        "opencode is unreachable.".to_string()
+    };
+    if let Some(detail) = detail {
+        text.push('\n');
+        text.push_str(detail);
+    }
+    if let Err(error) = state.notifier.notify_system(&text).await {
+        tracing::warn!(%error, "failed to send health notification");
+    }
+}
+
 async fn resync(state: &AppState) -> Result<()> {
     let statuses = state.backend.session_statuses().await?;
     let sessions = state.backend.list_sessions().await?;

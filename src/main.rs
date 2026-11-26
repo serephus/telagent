@@ -123,6 +123,9 @@ async fn run_daemon(config: Config) -> Result<()> {
     let notification_state = (*state).clone();
     let notification_task = tokio::spawn(daemon::notification_loop(notification_state));
 
+    let health_state = (*state).clone();
+    let health_task = tokio::spawn(daemon::health_loop(health_state));
+
     let event_state = (*state).clone();
     let event_task = tokio::spawn(daemon::event_loop(event_state));
 
@@ -133,6 +136,7 @@ async fn run_daemon(config: Config) -> Result<()> {
     outbox_task.abort();
     reconcile_task.abort();
     notification_task.abort();
+    health_task.abort();
     event_task.abort();
     Ok(())
 }

@@ -28,6 +28,8 @@ let
       username = cfg.opencode.username;
       events_path = cfg.opencode.eventsPath;
       auto_discover = cfg.opencode.autoDiscover;
+      health_interval_secs = cfg.opencode.healthIntervalSecs;
+      health_timeout_secs = cfg.opencode.healthTimeoutSecs;
     }
     // lib.optionalAttrs (cfg.opencode.passwordFile != null) {
       password_file = cfg.opencode.passwordFile;
@@ -157,6 +159,18 @@ in
         type = lib.types.nullOr lib.types.str;
         default = null;
         description = "Path to the opencode V2 service.json. Defaults to ~/.local/state/opencode/service.json.";
+      };
+
+      healthIntervalSecs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 30;
+        description = "Seconds between opencode health checks.";
+      };
+
+      healthTimeoutSecs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 10;
+        description = "Timeout for each opencode health check.";
       };
     };
 

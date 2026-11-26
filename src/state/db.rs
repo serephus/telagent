@@ -878,6 +878,36 @@ impl Db {
         .await
     }
 
+    pub async fn remove_notifications_by_kind(&self, kind: &str) -> Result<()> {
+        let kind = kind.to_string();
+        self.run(move |db| {
+            let write = db.begin_write()?;
+            {
+                let mut table = write.open_table(NOTIFICATION_OUTBOX)?;
+                let keys = table
+                    .iter()?
+                    .filter_map(|entry| {
+                        entry
+                            .ok()
+                            .map(|(key, value)| (key.value().to_string(), value.value().to_vec()))
+                    })
+                    .filter(|(_, value)| {
+                        decode::<NotificationOutboxItem>(value)
+                            .map(|item| item.kind == kind)
+                            .unwrap_or(false)
+                    })
+                    .map(|(key, _)| key)
+                    .collect::<Vec<_>>();
+                for key in keys {
+                    table.remove(key.as_str())?;
+                }
+            }
+            write.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn increment_notification_attempts(&self, key: &str) -> Result<i64> {
         let key = key.to_string();
         self.run(move |db| {
@@ -1114,6 +1144,38 @@ mod tests {
 
         db.remove_notification(&key).await.unwrap();
         assert!(db.list_notifications(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn removes_notifications_by_kind() {
+        let (_dir, db) = temp_db().await;
+        db.enqueue_notification(NewNotification {
+            chat_id: 1,
+            session_id: "",
+            message_id: "system:1",
+            kind: "system",
+            text: "offline",
+            markup: None,
+            payload: None,
+        })
+        .await
+        .unwrap();
+        db.enqueue_notification(NewNotification {
+            chat_id: 1,
+            session_id: "ses_1",
+            message_id: "msg_1",
+            kind: "completion",
+            text: "done",
+            markup: None,
+            payload: None,
+        })
+        .await
+        .unwrap();
+
+        db.remove_notifications_by_kind("system").await.unwrap();
+        let items = db.list_notifications(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "completion");
     }
 
     #[tokio::test]

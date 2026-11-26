@@ -224,7 +224,9 @@ unavailable, delivery is retried with exponential backoff instead of being
 dropped. Permission and question requests become answerable only after their
 message is delivered, and retries re-check opencode first so already-resolved
 requests are discarded. If fetching a completion result fails, the session is
-marked notification-pending and retried by the periodic reconciler.
+marked notification-pending and retried by the periodic reconciler. Notifications
+that exhaust all retry attempts are recorded as dead letters, and `/status` shows
+the most recent drops.
 
 telagent probes the opencode health endpoint every `opencode.health_interval_secs`
 seconds. A failed probe marks the backend unreachable and sends one Telegram

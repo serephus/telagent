@@ -104,6 +104,7 @@ impl Notifier {
                         continue;
                     }
                     Err(error) => {
+                        let reason = error.to_string();
                         tracing::warn!(
                             session_id = %item.session_id,
                             request_id = %item.message_id,
@@ -112,6 +113,17 @@ impl Notifier {
                         );
                         let attempts = self.db.increment_notification_attempts(&item.key).await?;
                         if attempts >= MAX_NOTIFICATION_ATTEMPTS {
+                            tracing::error!(
+                                session_id = %item.session_id,
+                                request_id = %item.message_id,
+                                %error,
+                                "dropping unvalidated notification"
+                            );
+                            if let Err(error) =
+                                self.db.record_dead_notification(&item, &reason).await
+                            {
+                                tracing::warn!(%error, "failed to record dead notification");
+                            }
                             self.db.remove_notification(&item.key).await?;
                         }
                         continue;
@@ -149,6 +161,7 @@ impl Notifier {
                     let _ = self.db.remove_notification(&item.key).await;
                 }
                 Err(error) => {
+                    let reason = error.to_string();
                     tracing::warn!(
                         chat_id = item.chat_id,
                         session_id = %item.session_id,
@@ -158,11 +171,14 @@ impl Notifier {
                     );
                     let attempts = self.db.increment_notification_attempts(&item.key).await?;
                     if attempts >= MAX_NOTIFICATION_ATTEMPTS {
-                        tracing::warn!(
+                        tracing::error!(
                             chat_id = item.chat_id,
                             session_id = %item.session_id,
                             "dropping notification after repeated failures"
                         );
+                        if let Err(error) = self.db.record_dead_notification(&item, &reason).await {
+                            tracing::warn!(%error, "failed to record dead notification");
+                        }
                         self.db.remove_notification(&item.key).await?;
                     }
                 }

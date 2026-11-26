@@ -373,6 +373,18 @@ async fn handle_command(
                     ));
                 }
             }
+            let dead = state.db.list_dead_notifications(5).await?;
+            if let Some(last) = dead.first() {
+                text.push_str(&format!("\nDropped notifications (recent): {}", dead.len()));
+                text.push_str(&format!(
+                    "\nLast drop: {} {} chat {} after {} attempts: {}",
+                    last.kind,
+                    last.session_id,
+                    last.chat_id,
+                    last.attempts,
+                    render::truncate(&last.reason, 200)
+                ));
+            }
             send(bot, chat_id, text).await?;
         }
         "use" => {

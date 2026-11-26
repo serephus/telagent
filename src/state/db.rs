@@ -19,6 +19,8 @@ const PROCESSED: TableDefinition<i64, ()> = TableDefinition::new("processed_upda
 const OUTBOX: TableDefinition<i64, &[u8]> = TableDefinition::new("outbox");
 const NOTIFICATION_OUTBOX: TableDefinition<&str, &[u8]> =
     TableDefinition::new("notification_outbox");
+const NOTIFICATION_DEAD: TableDefinition<i64, &[u8]> = TableDefinition::new("notification_dead");
+const MAX_DEAD_NOTIFICATIONS: usize = 20;
 
 const SEPARATOR: char = '\u{1f}';
 
@@ -96,6 +98,18 @@ pub struct NewNotification<'a> {
     pub text: &'a str,
     pub markup: Option<&'a str>,
     pub payload: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadNotification {
+    pub chat_id: i64,
+    pub session_id: String,
+    pub message_id: String,
+    pub kind: String,
+    pub attempts: i64,
+    pub reason: String,
+    pub created_at: i64,
+    pub dropped_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1027,6 +1041,74 @@ impl Db {
         })
         .await
     }
+
+    pub async fn record_dead_notification(
+        &self,
+        item: &NotificationOutboxItem,
+        reason: &str,
+    ) -> Result<()> {
+        let record = DeadNotification {
+            chat_id: item.chat_id,
+            session_id: item.session_id.clone(),
+            message_id: item.message_id.clone(),
+            kind: item.kind.clone(),
+            attempts: item.attempts,
+            reason: reason.to_string(),
+            created_at: item.created_at,
+            dropped_at: now(),
+        };
+        self.run(move |db| {
+            let write = db.begin_write()?;
+            let id = {
+                let mut kv = write.open_table(KV)?;
+                let next = kv
+                    .get("notification_dead_seq")?
+                    .and_then(|value| {
+                        std::str::from_utf8(value.value())
+                            .ok()
+                            .and_then(|value| value.parse::<u64>().ok())
+                    })
+                    .unwrap_or(0)
+                    + 1;
+                let next_bytes = next.to_string();
+                kv.insert("notification_dead_seq", next_bytes.as_bytes())?;
+                next as i64
+            };
+            {
+                let mut table = write.open_table(NOTIFICATION_DEAD)?;
+                let bytes = encode(&record)?;
+                table.insert(id, bytes.as_slice())?;
+                let mut keys = table
+                    .iter()?
+                    .filter_map(|entry| entry.ok().map(|(key, _)| key.value()))
+                    .collect::<Vec<_>>();
+                keys.sort_unstable();
+                let excess = keys.len().saturating_sub(MAX_DEAD_NOTIFICATIONS);
+                for key in keys.into_iter().take(excess) {
+                    table.remove(key)?;
+                }
+            }
+            write.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn list_dead_notifications(&self, limit: usize) -> Result<Vec<DeadNotification>> {
+        self.run(move |db| {
+            let read = db.begin_read()?;
+            let table = read.open_table(NOTIFICATION_DEAD)?;
+            let mut items = Vec::new();
+            for entry in table.iter()? {
+                let (_, value) = entry?;
+                items.push(decode::<DeadNotification>(value.value())?);
+            }
+            items.sort_by_key(|item| std::cmp::Reverse(item.dropped_at));
+            items.truncate(limit);
+            Ok(items)
+        })
+        .await
+    }
 }
 
 fn notification_key(chat_id: i64, session_id: &str, message_id: &str) -> String {
@@ -1045,6 +1127,7 @@ fn initialize(db: &Database) -> Result<()> {
         let _ = write.open_table(PROCESSED)?;
         let _ = write.open_table(OUTBOX)?;
         let _ = write.open_table(NOTIFICATION_OUTBOX)?;
+        let _ = write.open_table(NOTIFICATION_DEAD)?;
     }
     write.commit()?;
     Ok(())
@@ -1290,6 +1373,35 @@ mod tests {
         let items = db.list_notifications(10).await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, "completion");
+    }
+
+    #[tokio::test]
+    async fn keeps_recent_dead_notifications() {
+        let (_dir, db) = temp_db().await;
+        let item = NotificationOutboxItem {
+            key: "key".to_string(),
+            chat_id: 1,
+            session_id: "ses_1".to_string(),
+            message_id: "msg_1".to_string(),
+            kind: "completion".to_string(),
+            text: "done".to_string(),
+            markup: None,
+            payload: None,
+            attempts: 50,
+            next_attempt_at: 0,
+            created_at: 0,
+        };
+        for index in 0..25 {
+            let mut item = item.clone();
+            item.message_id = format!("msg_{index}");
+            db.record_dead_notification(&item, "network down")
+                .await
+                .unwrap();
+        }
+
+        let dead = db.list_dead_notifications(100).await.unwrap();
+        assert_eq!(dead.len(), MAX_DEAD_NOTIFICATIONS);
+        assert_eq!(dead[0].reason, "network down");
     }
 
     #[tokio::test]

@@ -6,8 +6,8 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    naersk = {
-      url = "github:nix-community/naersk";
+    crate2nix = {
+      url = "github:nix-community/crate2nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     nixit = {
@@ -15,7 +15,6 @@
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.flake-utils.follows = "flake-utils";
       inputs.rust-overlay.follows = "rust-overlay";
-      inputs.naersk.follows = "naersk";
     };
   };
 
@@ -26,7 +25,7 @@
       flake-utils,
       nixit,
       rust-overlay,
-      naersk,
+      crate2nix,
       ...
     }:
     let
@@ -125,12 +124,11 @@
             "rust-analyzer"
           ];
         };
-        naersk' = pkgs.callPackage naersk { };
-        package = naersk'.buildPackage {
+        cargoNix = crate2nix.tools.${system}.appliedCargoNix {
+          name = "telagent";
           src = ./.;
-          rustc = rust;
-          cargo = rust;
         };
+        package = cargoNix.rootCrate.build;
         devShell =
           with pkgs;
           mkShell {

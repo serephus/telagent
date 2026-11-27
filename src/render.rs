@@ -538,26 +538,58 @@ pub fn completion_message(
         session_title(session),
         session.directory
     );
+    message.push_str(&context_metadata(context));
+    if let Some(body) = body {
+        message.push_str("\n\n");
+        message.push_str(body.trim());
+    }
+    message
+}
+
+fn context_metadata(context: Option<&SessionContext>) -> String {
+    let mut metadata = String::new();
     if let Some(context) = context {
         if let Some(model) = &context.model {
-            message.push_str(&format!("\nModel: {model}"));
+            metadata.push_str(&format!("\nModel: {model}"));
         }
         if let (Some(used), Some(limit)) = (context.used_tokens, context.context_limit)
             && limit > 0
         {
             let percent = (used as f64 / limit as f64 * 100.0).round() as u64;
-            message.push_str(&format!(
+            metadata.push_str(&format!(
                 "\nContext: {percent}% ({}/{})",
                 compact_tokens(used),
                 compact_tokens(limit)
             ));
         }
     }
-    if let Some(body) = body {
-        message.push_str("\n\n");
-        message.push_str(body.trim());
+    metadata
+}
+
+fn notification_kind_label(kind: &str) -> &str {
+    match kind {
+        "completion" => "Session finished",
+        "error" => "Session error",
+        "permission" => "Permission requested",
+        "question" => "Question",
+        "created" => "Session started",
+        _ => kind,
     }
-    message
+}
+
+pub fn session_metadata(
+    kind: &str,
+    session: &SessionRecord,
+    context: Option<&SessionContext>,
+) -> String {
+    format!(
+        "{}\nSession: {}\nTitle: {}\nDirectory: {}{}",
+        notification_kind_label(kind),
+        session.session_id,
+        session_title(session),
+        session.directory,
+        context_metadata(context)
+    )
 }
 
 fn compact_tokens(tokens: u64) -> String {
@@ -733,6 +765,24 @@ mod tests {
         let message = completion_message(&session, None, Some(&context));
         assert!(message.contains("Model: gpt-5"));
         assert!(message.contains("Context: 75% (750k/1.0M)"));
+    }
+
+    #[test]
+    fn session_metadata_includes_session_and_context() {
+        let session = test_session();
+        let context = SessionContext {
+            model: Some("gpt-5".to_string()),
+            used_tokens: Some(750_000),
+            context_limit: Some(1_000_000),
+        };
+
+        let metadata = session_metadata("completion", &session, Some(&context));
+        assert!(metadata.starts_with("Session finished"));
+        assert!(metadata.contains("Session: ses_1"));
+        assert!(metadata.contains("Title: Test"));
+        assert!(metadata.contains("Directory: /tmp"));
+        assert!(metadata.contains("Model: gpt-5"));
+        assert!(metadata.contains("Context: 75% (750k/1.0M)"));
     }
 
     fn test_session() -> SessionRecord {

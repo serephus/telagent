@@ -114,7 +114,8 @@ impl Notifier {
             .prepare_text(
                 &render::completion_message(session, body, context),
                 "completion",
-                &session.session_id,
+                session,
+                context,
             )
             .await;
         let markup = completion_markup(&session.session_id);
@@ -283,7 +284,8 @@ impl Notifier {
             .prepare_text(
                 &render::error_message(session, error),
                 "error",
-                &session.session_id,
+                session,
+                None,
             )
             .await;
         let dedupe_id = unique_notification_id("error");
@@ -307,7 +309,8 @@ impl Notifier {
             .prepare_text(
                 &render::permission_message(session, request),
                 "permission",
-                &session.session_id,
+                session,
+                None,
             )
             .await;
         let payload = serde_json::to_string(request)?;
@@ -331,7 +334,8 @@ impl Notifier {
             .prepare_text(
                 &render::question_message(session, request),
                 "question",
-                &session.session_id,
+                session,
+                None,
             )
             .await;
         let payload = serde_json::to_string(request)?;
@@ -364,7 +368,8 @@ impl Notifier {
                     session.directory
                 ),
                 "created",
-                &session.session_id,
+                session,
+                None,
             )
             .await;
         let dedupe_id = unique_notification_id("created");
@@ -486,20 +491,28 @@ impl Notifier {
         Ok(())
     }
 
-    async fn prepare_text(&self, text: &str, kind: &str, session_id: &str) -> String {
-        let mut text = text.to_string();
-        if self.paste.should_paste(&text) {
-            let title = format!("telagent {kind} {session_id}");
-            match self.paste.upload(&text, &title, None).await {
+    async fn prepare_text(
+        &self,
+        text: &str,
+        kind: &str,
+        session: &SessionRecord,
+        context: Option<&SessionContext>,
+    ) -> String {
+        if self.paste.should_paste(text) {
+            let title = format!("telagent {kind} {}", session.session_id);
+            match self.paste.upload(text, &title, None).await {
                 Ok(url) => {
-                    text = format!("Full message is too long for Telegram:\n{url}");
+                    return format!(
+                        "{}\n\nFull message is too long for Telegram:\n{url}",
+                        render::session_metadata(kind, session, context)
+                    );
                 }
                 Err(error) => {
                     tracing::warn!(%error, "paste upload failed; falling back to chunks");
                 }
             }
         }
-        text
+        text.to_string()
     }
 
     async fn send_chat_text(

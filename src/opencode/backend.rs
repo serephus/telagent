@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use futures_util::Stream;
 
 use crate::opencode::types::{
-    MessageWithParts, PermissionReply, PermissionRequest, QuestionRequest, RawEvent,
-    SessionContext, SessionInfo, SessionStatus,
+    MessageWithParts, ModelInfo, ModelRef, PermissionReply, PermissionRequest, QuestionRequest,
+    RawEvent, SessionContext, SessionInfo, SessionStatus,
 };
 
 pub type EventStream = Pin<Box<dyn Stream<Item = anyhow::Result<RawEvent>> + Send>>;
@@ -26,6 +26,15 @@ pub trait OpenCodeBackend: Send + Sync {
     async fn create_session(&self, directory: &str) -> anyhow::Result<SessionInfo>;
 
     async fn compact_session(&self, session_id: &str, directory: &str) -> anyhow::Result<()>;
+
+    async fn list_models(&self, directory: &str) -> anyhow::Result<Vec<ModelInfo>>;
+
+    async fn switch_model(
+        &self,
+        session_id: &str,
+        directory: &str,
+        model: &ModelRef,
+    ) -> anyhow::Result<()>;
 
     async fn session_context(
         &self,

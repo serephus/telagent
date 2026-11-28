@@ -22,6 +22,33 @@ pub struct SessionModel {
     pub provider_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRef {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+impl ModelRef {
+    pub fn reference(&self) -> String {
+        format!("{}/{}", self.provider_id, self.model_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub model_id: String,
+    pub model_name: String,
+    pub context_limit: Option<u64>,
+}
+
+impl ModelInfo {
+    pub fn reference(&self) -> String {
+        format!("{}/{}", self.provider_id, self.model_id)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionContext {
     pub model: Option<String>,

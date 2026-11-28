@@ -13,9 +13,9 @@ use crate::{
     opencode::{
         backend::{AgentEvent, EventStream, OpenCodeBackend},
         types::{
-            CacheTokens, MessageInfo, MessageTime, MessageTokens, MessageWithParts, Part,
-            PermissionReply, PermissionRequest, QuestionRequest, RawEvent, SessionContext,
-            SessionInfo, SessionModel, SessionStatus,
+            CacheTokens, MessageInfo, MessageTime, MessageTokens, MessageWithParts, ModelInfo,
+            ModelRef, Part, PermissionReply, PermissionRequest, QuestionRequest, RawEvent,
+            SessionContext, SessionInfo, SessionModel, SessionStatus,
         },
     },
 };
@@ -287,6 +287,85 @@ impl OpenCodeBackend for V2Http {
     async fn compact_session(&self, session_id: &str, _directory: &str) -> Result<()> {
         self.post_empty(&format!("/api/session/{session_id}/compact"))
             .await
+    }
+
+    async fn list_models(&self, directory: &str) -> Result<Vec<ModelInfo>> {
+        let mut request = self.request(reqwest::Method::GET, "/api/model");
+        if !directory.is_empty() {
+            request = request.query(&[("location[directory]", directory)]);
+        }
+        let response: ModelsResponse = decode(request.send().await?).await?;
+
+        let mut provider_names = HashMap::new();
+        if let Ok(response) = self.get_json::<ProvidersResponse>("/api/provider").await {
+            for provider in response.data {
+                provider_names.insert(provider.id, provider.name);
+            }
+        }
+
+        let mut models = response
+            .data
+            .into_iter()
+            .map(|model| {
+                let provider_name = provider_names
+                    .get(&model.provider_id)
+                    .filter(|name| !name.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| model.provider_id.clone());
+                let model_name = model
+                    .name
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| model.id.clone());
+                ModelInfo {
+                    provider_id: model.provider_id,
+                    provider_name,
+                    model_id: model.id,
+                    model_name,
+                    context_limit: model.limit.and_then(|limit| limit.context),
+                }
+            })
+            .collect::<Vec<_>>();
+        models.sort_by(|left, right| {
+            left.provider_name
+                .to_lowercase()
+                .cmp(&right.provider_name.to_lowercase())
+                .then_with(|| {
+                    left.model_name
+                        .to_lowercase()
+                        .cmp(&right.model_name.to_lowercase())
+                })
+        });
+        Ok(models)
+    }
+
+    async fn switch_model(
+        &self,
+        session_id: &str,
+        _directory: &str,
+        model: &ModelRef,
+    ) -> Result<()> {
+        #[derive(serde::Serialize)]
+        struct ModelBody<'a> {
+            id: &'a str,
+            #[serde(rename = "providerID")]
+            provider_id: &'a str,
+        }
+
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            model: ModelBody<'a>,
+        }
+
+        self.post_json(
+            &format!("/api/session/{session_id}/model"),
+            &Body {
+                model: ModelBody {
+                    id: &model.model_id,
+                    provider_id: &model.provider_id,
+                },
+            },
+        )
+        .await
     }
 
     async fn session_context(
@@ -566,6 +645,42 @@ struct SessionsResponse {
 #[derive(Debug, Deserialize)]
 struct CreateSessionResponse {
     data: V2Session,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsResponse {
+    #[serde(default)]
+    data: Vec<V2ModelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2ModelInfo {
+    id: String,
+    #[serde(rename = "providerID")]
+    provider_id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    limit: Option<V2ModelLimit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2ModelLimit {
+    #[serde(default)]
+    context: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProvidersResponse {
+    #[serde(default)]
+    data: Vec<V2Provider>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2Provider {
+    id: String,
+    #[serde(default)]
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1410,5 +1525,89 @@ mod integration_tests {
             normalize_v2_event(raw),
             AgentEvent::SessionIdle(id) if id == "ses_1"
         ));
+    }
+
+    #[tokio::test]
+    async fn lists_and_switches_models() {
+        use std::collections::HashMap;
+
+        let captured = Arc::new(Mutex::new(None));
+        let query_captured = Arc::new(Mutex::new(None));
+
+        let model_query = query_captured.clone();
+        let models = get(move |Query(query): Query<HashMap<String, String>>| {
+            let captured = model_query.clone();
+            async move {
+                *captured.lock().unwrap() = Some(query);
+                Json(json!({
+                    "location": {"directory": "/tmp/project"},
+                    "data": [{
+                        "id": "gpt-5",
+                        "providerID": "openai",
+                        "name": "GPT-5",
+                        "limit": {"context": 1000000}
+                    }]
+                }))
+            }
+        });
+
+        let switch_state = captured.clone();
+        let switch = post(move |Json(body): Json<Value>| {
+            let captured = switch_state.clone();
+            async move {
+                *captured.lock().unwrap() = Some(body);
+                AxumStatus::NO_CONTENT
+            }
+        });
+
+        let router = Router::new()
+            .route("/api/model", models)
+            .route(
+                "/api/provider",
+                get(|| async {
+                    Json(json!({
+                        "data": [{"id": "openai", "name": "OpenAI"}]
+                    }))
+                }),
+            )
+            .route("/api/session/{session_id}/model", switch);
+        let url = spawn(router).await;
+        let client = V2Http::new(&OpenCodeConfig {
+            backend: "v2".to_string(),
+            url,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let models = client.list_models("/tmp/project").await.unwrap();
+        assert_eq!(models[0].reference(), "openai/gpt-5");
+        assert_eq!(models[0].provider_name, "OpenAI");
+        assert_eq!(models[0].context_limit, Some(1_000_000));
+        assert_eq!(
+            query_captured
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get("location[directory]")
+                .map(String::as_str),
+            Some("/tmp/project")
+        );
+
+        client
+            .switch_model(
+                "ses_1",
+                "/tmp/project",
+                &ModelRef {
+                    provider_id: "openai".to_string(),
+                    model_id: "gpt-5".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let body = captured.lock().unwrap();
+        let body = body.as_ref().unwrap();
+        assert_eq!(body["model"]["id"], "gpt-5");
+        assert_eq!(body["model"]["providerID"], "openai");
     }
 }

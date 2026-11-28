@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::{Client, RequestBuilder, StatusCode};
 use reqwest_eventsource::{Event, EventSource};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::{
@@ -13,8 +13,8 @@ use crate::{
     opencode::{
         backend::{EventStream, OpenCodeBackend},
         types::{
-            MessageWithParts, PermissionReply, PermissionRequest, QuestionRequest, RawEvent,
-            SessionContext, SessionInfo, SessionStatus,
+            MessageWithParts, ModelInfo, ModelRef, PermissionReply, PermissionRequest,
+            QuestionRequest, RawEvent, SessionContext, SessionInfo, SessionStatus,
         },
     },
 };
@@ -180,6 +180,94 @@ impl OpenCodeBackend for V1Http {
         .await
     }
 
+    async fn list_models(&self, _directory: &str) -> Result<Vec<ModelInfo>> {
+        let response: ProvidersResponse = self.get_json("/config/providers", "").await?;
+        let mut models = Vec::new();
+        for provider in response.providers {
+            let provider_name = if provider.name.trim().is_empty() {
+                provider.id.clone()
+            } else {
+                provider.name
+            };
+            for (key, model) in provider.models {
+                let model_id = model.id.unwrap_or(key);
+                let model_name = model
+                    .name
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| model_id.clone());
+                models.push(ModelInfo {
+                    provider_id: provider.id.clone(),
+                    provider_name: provider_name.clone(),
+                    model_id,
+                    model_name,
+                    context_limit: model.limit.and_then(|limit| limit.context),
+                });
+            }
+        }
+        models.sort_by(|left, right| {
+            left.provider_name
+                .to_lowercase()
+                .cmp(&right.provider_name.to_lowercase())
+                .then_with(|| {
+                    left.model_name
+                        .to_lowercase()
+                        .cmp(&right.model_name.to_lowercase())
+                })
+        });
+        Ok(models)
+    }
+
+    async fn switch_model(
+        &self,
+        session_id: &str,
+        directory: &str,
+        model: &ModelRef,
+    ) -> Result<()> {
+        #[derive(Serialize)]
+        struct TextPart<'a> {
+            #[serde(rename = "type")]
+            kind: &'static str,
+            text: &'a str,
+            synthetic: bool,
+            ignored: bool,
+        }
+
+        #[derive(Serialize)]
+        struct ModelBody<'a> {
+            #[serde(rename = "providerID")]
+            provider_id: &'a str,
+            #[serde(rename = "modelID")]
+            model_id: &'a str,
+        }
+
+        #[derive(Serialize)]
+        struct Body<'a> {
+            parts: Vec<TextPart<'a>>,
+            model: ModelBody<'a>,
+            #[serde(rename = "noReply")]
+            no_reply: bool,
+        }
+
+        self.post_json(
+            &format!("/session/{session_id}/prompt_async"),
+            directory,
+            &Body {
+                parts: vec![TextPart {
+                    kind: "text",
+                    text: "",
+                    synthetic: true,
+                    ignored: true,
+                }],
+                model: ModelBody {
+                    provider_id: &model.provider_id,
+                    model_id: &model.model_id,
+                },
+                no_reply: true,
+            },
+        )
+        .await
+    }
+
     async fn session_context(
         &self,
         session_id: &str,
@@ -259,12 +347,33 @@ impl OpenCodeBackend for V1Http {
         }
 
         #[derive(Serialize)]
-        struct Body<'a> {
-            parts: Vec<TextPart<'a>>,
+        struct ModelBody {
+            #[serde(rename = "providerID")]
+            provider_id: String,
+            #[serde(rename = "modelID")]
+            model_id: String,
         }
 
+        #[derive(Serialize)]
+        struct Body<'a> {
+            parts: Vec<TextPart<'a>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            model: Option<ModelBody>,
+        }
+
+        let model = self
+            .get_session(session_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|session| session.model)
+            .map(|model| ModelBody {
+                provider_id: model.provider_id,
+                model_id: model.id,
+            });
         let body = Body {
             parts: vec![TextPart { kind: "text", text }],
+            model,
         };
         self.post_json(
             &format!("/session/{session_id}/prompt_async"),
@@ -381,6 +490,37 @@ impl OpenCodeBackend for V1Http {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ProvidersResponse {
+    #[serde(default)]
+    providers: Vec<ProviderInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderInfo {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    models: HashMap<String, ProviderModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderModel {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    limit: Option<ProviderModelLimit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderModelLimit {
+    #[serde(default)]
+    context: Option<u64>,
+}
+
 fn directory_query(directory: &str) -> Vec<(&str, &str)> {
     if directory.is_empty() {
         Vec::new()
@@ -473,6 +613,36 @@ mod tests {
             .route(
                 "/session/status",
                 get(|| async { Json(json!({"ses_1": {"type": "busy"}})) }),
+            )
+            .route(
+                "/session/{session_id}",
+                get(|| async {
+                    Json(json!({
+                        "id": "ses_1",
+                        "title": "Test session",
+                        "directory": "/tmp",
+                        "model": {"id": "gpt-5", "providerID": "openai"}
+                    }))
+                }),
+            )
+            .route(
+                "/config/providers",
+                get(|| async {
+                    Json(json!({
+                        "providers": [{
+                            "id": "openai",
+                            "name": "OpenAI",
+                            "models": {
+                                "gpt-5": {
+                                    "id": "gpt-5",
+                                    "name": "GPT-5",
+                                    "limit": {"context": 1000000}
+                                }
+                            }
+                        }],
+                        "default": {"openai": "gpt-5"}
+                    }))
+                }),
             )
             .route(
                 "/session/{session_id}/message",
@@ -764,6 +934,10 @@ mod tests {
         let statuses = client.session_statuses().await.unwrap();
         assert_eq!(statuses.get("ses_1"), Some(&SessionStatus::Busy));
 
+        let models = client.list_models("").await.unwrap();
+        assert_eq!(models[0].reference(), "openai/gpt-5");
+        assert_eq!(models[0].context_limit, Some(1_000_000));
+
         let messages = client.messages("ses_1", "", 10).await.unwrap();
         assert_eq!(messages[0].text(), "done");
 
@@ -771,6 +945,10 @@ mod tests {
         assert_eq!(
             captured.lock().unwrap().as_ref().unwrap()["parts"][0]["text"],
             "hello"
+        );
+        assert_eq!(
+            captured.lock().unwrap().as_ref().unwrap()["model"]["providerID"],
+            "openai"
         );
 
         client
@@ -795,5 +973,36 @@ mod tests {
         let mut stream = client.event_stream().await.unwrap();
         let raw = stream.next().await.unwrap().unwrap();
         assert_eq!(raw.event_type, "session.idle");
+    }
+
+    #[tokio::test]
+    async fn switches_model_with_no_reply_prompt() {
+        let (router, captured) = app();
+        let url = spawn(router).await;
+        let config = OpenCodeConfig {
+            url,
+            ..Default::default()
+        };
+        let client = V1Http::new(&config).unwrap();
+
+        client
+            .switch_model(
+                "ses_1",
+                "/tmp/project",
+                &ModelRef {
+                    provider_id: "openai".to_string(),
+                    model_id: "gpt-5".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let body = captured.lock().unwrap();
+        let body = body.as_ref().unwrap();
+        assert_eq!(body["model"]["providerID"], "openai");
+        assert_eq!(body["model"]["modelID"], "gpt-5");
+        assert_eq!(body["noReply"], true);
+        assert_eq!(body["parts"][0]["ignored"], true);
+        assert_eq!(body["parts"][0]["synthetic"], true);
     }
 }

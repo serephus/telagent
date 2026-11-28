@@ -13,7 +13,7 @@ use teloxide::{
 
 use crate::{
     app::AppState,
-    opencode::types::{PermissionReply, PermissionRequest, QuestionRequest},
+    opencode::types::{ModelInfo, ModelRef, PermissionReply, PermissionRequest, QuestionRequest},
     pairing, render,
 };
 
@@ -341,6 +341,9 @@ async fn handle_command(
                 }
             }
         }
+        "model" | "models" => {
+            handle_model_command(bot, state, chat_id, parsed.raw_args, reply_session_id).await?;
+        }
         "sessions" => {
             send_sessions(bot, state, chat_id).await?;
         }
@@ -646,6 +649,199 @@ fn append_export_urls(message: &mut String, urls: &[String]) {
     for (index, url) in urls.iter().enumerate() {
         message.push_str(&format!("\n{}. {url}", index + 1));
     }
+}
+
+async fn handle_model_command(
+    bot: &Bot,
+    state: &AppState,
+    chat_id: ChatId,
+    raw_args: &str,
+    reply_session_id: Option<&str>,
+) -> Result<()> {
+    let session_id = match reply_session_id {
+        Some(session_id) => Some(session_id.to_string()),
+        None => state.db.active_session(chat_id.0).await?,
+    };
+    let directory = model_directory(state, session_id.as_deref()).await?;
+    let models = match state.backend.list_models(&directory).await {
+        Ok(models) => models,
+        Err(error) => {
+            send(bot, chat_id, format!("Failed to list models: {error}")).await?;
+            return Ok(());
+        }
+    };
+
+    let args = split_args(raw_args);
+    let Some(spec) = args.first() else {
+        let current = match &session_id {
+            Some(session_id) => state
+                .backend
+                .get_session(session_id)
+                .await?
+                .and_then(|session| session.model)
+                .map(|model| format!("{}/{}", model.provider_id, model.id)),
+            None => None,
+        };
+        let text = models_summary(&models, current.as_deref(), session_id.as_deref());
+        send_chunked_message(bot, state, chat_id, &text).await?;
+        return Ok(());
+    };
+
+    let Some((provider_id, model_id)) = spec.split_once('/') else {
+        let matching = models
+            .iter()
+            .filter(|model| model.provider_id == *spec || model.model_id == *spec)
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            send(
+                bot,
+                chat_id,
+                format!("Unknown provider or model {spec}. Use /model to list providers."),
+            )
+            .await?;
+            return Ok(());
+        }
+        let text = models_list_message(spec, &matching);
+        send_chunked_message(bot, state, chat_id, &text).await?;
+        return Ok(());
+    };
+
+    let Some(session_id) = session_id else {
+        send(
+            bot,
+            chat_id,
+            "No active session. Reply to a notification or use /use ID.",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let known = models
+        .iter()
+        .find(|model| model.provider_id == provider_id && model.model_id == model_id);
+    if !models.is_empty() && known.is_none() {
+        send(
+            bot,
+            chat_id,
+            format!("Unknown model {spec}. Use /model {provider_id} to list its models."),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let target = ModelRef {
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+    };
+    match state
+        .backend
+        .switch_model(&session_id, &directory, &target)
+        .await
+    {
+        Ok(()) => {
+            let label = known
+                .map(|model| format!("{} ({})", model.model_name, model.reference()))
+                .unwrap_or_else(|| target.reference());
+            send(
+                bot,
+                chat_id,
+                format!("Session {session_id} model switched to {label}."),
+            )
+            .await?;
+        }
+        Err(error) => {
+            send(bot, chat_id, format!("Model switch failed: {error}")).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn model_directory(state: &AppState, session_id: Option<&str>) -> Result<String> {
+    if let Some(session_id) = session_id {
+        let directory = state.session_directory(session_id).await?;
+        if !directory.is_empty() {
+            return Ok(directory);
+        }
+    }
+    Ok(state
+        .config
+        .opencode
+        .directory
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default())
+}
+
+fn models_summary(models: &[ModelInfo], current: Option<&str>, session_id: Option<&str>) -> String {
+    let mut text = String::from("Models\n");
+    if let Some(session_id) = session_id {
+        text.push_str(&format!("Session: {session_id}\n"));
+    }
+    text.push_str(&format!(
+        "Current model: {}\n",
+        current.unwrap_or("unknown")
+    ));
+
+    let mut providers: Vec<(&str, &str, usize)> = Vec::new();
+    for model in models {
+        if let Some((_, _, count)) = providers
+            .iter_mut()
+            .find(|(provider_id, _, _)| *provider_id == model.provider_id.as_str())
+        {
+            *count += 1;
+        } else {
+            providers.push((model.provider_id.as_str(), model.provider_name.as_str(), 1));
+        }
+    }
+
+    if providers.is_empty() {
+        text.push_str("\nNo models reported by the backend.");
+        return text;
+    }
+
+    text.push_str("\nProviders:\n");
+    for (provider_id, provider_name, count) in providers {
+        let count = if count == 1 {
+            "1 model".to_string()
+        } else {
+            format!("{count} models")
+        };
+        if provider_name == provider_id {
+            text.push_str(&format!("- {provider_name} ({count})\n"));
+        } else {
+            text.push_str(&format!("- {provider_name} [{provider_id}] ({count})\n"));
+        }
+    }
+    text.push_str("\nUse /model PROVIDER to list models.\nUse /model PROVIDER/MODEL to switch.");
+    text
+}
+
+fn models_list_message(label: &str, models: &[&ModelInfo]) -> String {
+    let mut text = format!("Models for {label}\n");
+    for model in models {
+        text.push_str(&format!("\n{}", model.reference()));
+        if model.model_name != model.model_id {
+            text.push_str(&format!(" - {}", model.model_name));
+        }
+        if let Some(limit) = model.context_limit {
+            text.push_str(&format!(" (context {limit})"));
+        }
+    }
+    text.push_str("\n\nUse /model PROVIDER/MODEL to switch.");
+    text
+}
+
+async fn send_chunked_message(
+    bot: &Bot,
+    state: &AppState,
+    chat_id: ChatId,
+    text: &str,
+) -> Result<()> {
+    for chunk in render::chunk_text(text, state.config.notify.max_telegram_chars) {
+        send(bot, chat_id, chunk).await?;
+    }
+    Ok(())
 }
 
 async fn send_export_message(
@@ -1272,5 +1468,42 @@ mod tests {
         assert!(!callback_expired(now, 3600));
         assert!(callback_expired(now - 3601, 3600));
         assert!(!callback_expired(now - 10_000, 0));
+    }
+
+    fn model(
+        provider_id: &str,
+        provider_name: &str,
+        model_id: &str,
+        model_name: &str,
+    ) -> ModelInfo {
+        ModelInfo {
+            provider_id: provider_id.to_string(),
+            provider_name: provider_name.to_string(),
+            model_id: model_id.to_string(),
+            model_name: model_name.to_string(),
+            context_limit: Some(200_000),
+        }
+    }
+
+    #[test]
+    fn summarizes_models_by_provider() {
+        let models = vec![
+            model("openai", "OpenAI", "gpt-5", "GPT-5"),
+            model("openai", "OpenAI", "gpt-4", "GPT-4"),
+            model("anthropic", "Anthropic", "claude", "Claude"),
+        ];
+        let text = models_summary(&models, Some("openai/gpt-5"), Some("ses_1"));
+        assert!(text.contains("Current model: openai/gpt-5"));
+        assert!(text.contains("- OpenAI [openai] (2 models)"));
+        assert!(text.contains("- Anthropic [anthropic] (1 model)"));
+    }
+
+    #[test]
+    fn lists_provider_models_with_references() {
+        let models = [model("openai", "OpenAI", "gpt-5", "GPT-5")];
+        let refs = models.iter().collect::<Vec<_>>();
+        let text = models_list_message("openai", &refs);
+        assert!(text.contains("openai/gpt-5 - GPT-5 (context 200000)"));
+        assert!(text.contains("/model PROVIDER/MODEL"));
     }
 }

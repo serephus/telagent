@@ -156,6 +156,7 @@ and interact with the bot. An empty list relies on the pairing code alone.
 /unbind
 /new [DIRECTORY] [PROMPT]
 /compact [ID]
+/model [PROVIDER/MODEL]
 /sessions
 /use ID
 /cancel
@@ -209,6 +210,13 @@ Quote paths that contain spaces:
 ```
 
 `/compact` compacts the active session with its current model.
+
+`/model` shows the active session's current model and the available providers.
+Use `/model PROVIDER` to list that provider's models, and
+`/model PROVIDER/MODEL` to switch the active session (or the replied-to
+notification's session). The switch applies from the next model call onward.
+Both the V1 and V2 backends are supported; the V1 backend records the switch by
+sending a synthetic no-reply prompt that carries the selected model.
 
 Notifications also include inline buttons:
 

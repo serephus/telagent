@@ -39,6 +39,11 @@ pub const COMMANDS: &[CommandSpec] = &[
         description: "Compact the active session context",
     },
     CommandSpec {
+        name: "model",
+        usage: "[PROVIDER/MODEL]",
+        description: "Show or switch the session model",
+    },
+    CommandSpec {
         name: "sessions",
         usage: "",
         description: "List recent sessions",
